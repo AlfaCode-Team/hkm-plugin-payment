@@ -31,6 +31,7 @@ use Plugins\Payment\Application\Gateway\GatewayRegistry;
 use Plugins\Payment\Application\Gateway\InvalidSignatureException;
 use Plugins\Payment\Application\Gateway\ProviderRejectedException;
 use Plugins\Payment\Application\Ports\BankTransferGateway;
+use Plugins\Payment\Application\Ports\PaymentJournal;
 use Plugins\Payment\Application\Ports\PaymentGateway;
 use Plugins\Payment\Application\Ports\PaymentStore;
 use Plugins\Payment\Application\Ports\PhoneNumberStore;
@@ -65,6 +66,13 @@ use Plugins\Payment\Support\Messages;
  *     order; guessing "paid" would give away the goods.
  *  6. An announcement is recorded (notified_at) only once every listener has
  *     handled it; anything else is redelivered by reconcilePending().
+ *
+ * THE JOURNAL (since 1.1.0, `payment_events` via PaymentJournal): each step
+ * above — created, the provider's answer, every status change and what drove
+ * it (`via`), every callback and what came of it — is also written as history
+ * for an operator. Best-effort by design: a journal write that fails is logged
+ * and never stops the payment itself. `payments` is the truth; the journal is
+ * how a person reads what happened to it.
  */
 final class PaymentService implements PaymentServiceContract
 {
@@ -102,6 +110,7 @@ final class PaymentService implements PaymentServiceContract
         private readonly int $notifyGraceSeconds = 30,
         private readonly ?PhoneNumberStore $phones = null,
         private readonly bool $withdrawRequiresVerified = true,
+        private readonly ?PaymentJournal $journal = null,
     ) {
     }
 
@@ -228,7 +237,7 @@ final class PaymentService implements PaymentServiceContract
 
         if (\in_array($payment->status(), [PaymentStatus::Pending, PaymentStatus::Expired, PaymentStatus::Succeeded], true)) {
             try {
-                $this->reconcile($payment, $this->gateways->get($payment->provider()), null);
+                $this->reconcile($payment, $this->gateways->get($payment->provider()), null, 'check');
             } catch (GatewayException $e) {
                 throw PaymentException::providerUnavailable($reference, $e);
             }
@@ -249,7 +258,7 @@ final class PaymentService implements PaymentServiceContract
             && $payment->isStale($this->clock->now(), $this->refreshAfterSeconds)
             && $this->gateways->has($payment->provider())) {
             try {
-                $this->reconcile($payment, $this->gateways->get($payment->provider()), null);
+                $this->reconcile($payment, $this->gateways->get($payment->provider()), null, 'poll');
                 $payment = $this->reload($payment);
             } catch (\Throwable $e) {
                 // A poll must keep answering through a provider outage: the
@@ -269,10 +278,13 @@ final class PaymentService implements PaymentServiceContract
     public function handleNotification(string $provider, string $rawBody, \Closure $header): void
     {
         $gateway = $this->gateways->get($provider);
+        $entry   = ['provider' => $gateway->name(), 'kind' => 'webhook.received', 'payload' => $rawBody];
 
         try {
             $notification = $gateway->parseNotification($rawBody, $header);
         } catch (InvalidSignatureException $e) {
+            // Kept, but only the start of the body: it is unauthenticated input.
+            $this->journal(['outcome' => 'invalid_signature', 'payload' => mb_strcut($rawBody, 0, 2048, 'UTF-8')] + $entry);
             throw new SecurityException(
                 Messages::get('invalid_signature', 'Invalid webhook signature.'),
                 layer:    'payment.webhook.invalid_signature',
@@ -282,20 +294,32 @@ final class PaymentService implements PaymentServiceContract
             );
         } catch (GatewayException $e) {
             // Not a callback at all. Acknowledge it so nothing retries it forever.
+            $this->journal(['outcome' => 'unreadable', 'detail' => $e->getMessage()] + $entry);
             $this->logger?->notice('Ignored an unreadable payment callback', ['provider' => $gateway->name(), 'error' => $e->getMessage()]);
 
             return;
         }
 
+        $claimed = $notification->reference !== null && PaymentReference::isValid($notification->reference)
+            ? strtolower(trim($notification->reference))
+            : null;
+        $entryId = $this->journal([
+            'reference'     => $claimed,
+            'event_type'    => $notification->eventType,
+            'provider_uuid' => $notification->providerUuid,
+            'outcome'       => 'received',
+        ] + $entry);
+
         $payment = null;
-        if ($notification->reference !== null && PaymentReference::isValid($notification->reference)) {
-            $payment = $this->store->find(PaymentReference::from($notification->reference));
+        if ($claimed !== null) {
+            $payment = $this->store->find(PaymentReference::from($claimed));
         }
         if ($payment === null && $notification->providerUuid !== null && $notification->providerUuid !== '') {
             $payment = $this->store->findByProviderUuid($gateway->name(), $notification->providerUuid);
         }
 
         if ($payment === null || $payment->provider() !== $gateway->name()) {
+            $this->resolveJournal($entryId, 'unknown_payment', null, $notification->reference !== null ? 'reference: ' . $notification->reference : null);
             $this->logger?->info('Payment callback for an unknown payment', [
                 'provider'  => $gateway->name(),
                 'event'     => $notification->eventType,
@@ -304,6 +328,7 @@ final class PaymentService implements PaymentServiceContract
 
             return;
         }
+        $reference = (string) $payment->reference();
 
         $worthChecking = match ($payment->status()) {
             PaymentStatus::Pending, PaymentStatus::Expired => true,
@@ -311,6 +336,8 @@ final class PaymentService implements PaymentServiceContract
             default                                        => false,
         };
         if (!$worthChecking) {
+            $this->resolveJournal($entryId, 'already_settled', $reference, 'status: ' . $payment->status()->value);
+
             return; // a redelivery of something already applied
         }
 
@@ -318,16 +345,24 @@ final class PaymentService implements PaymentServiceContract
         // (the payer does) could otherwise turn this endpoint into a way to burn
         // the business's rate limit.
         if ($payment->checkedWithin($this->clock->now(), $this->webhookMinInterval)) {
-            throw PaymentException::throttled((string) $payment->reference());
+            $this->resolveJournal($entryId, 'throttled', $reference);
+            throw PaymentException::throttled($reference);
         }
 
         try {
-            $this->reconcile($payment, $gateway, $notification->providerUuid);
+            $outcome = $this->reconcile($payment, $gateway, $notification->providerUuid, 'webhook');
         } catch (GatewayException $e) {
             // Non-2xx on purpose: the provider redelivers, and by then its API
             // may answer.
-            throw PaymentException::providerUnavailable((string) $payment->reference(), $e);
+            $this->resolveJournal($entryId, 'provider_unreachable', $reference, $e->getMessage());
+            throw PaymentException::providerUnavailable($reference, $e);
         }
+
+        $this->resolveJournal($entryId, match ($outcome) {
+            'settled'      => 'applied',
+            'unverifiable' => 'unverifiable',
+            default        => 'no_change',
+        }, $reference);
     }
 
     public function reconcilePending(int $olderThanSeconds = 120, int $limit = 50): array
@@ -347,7 +382,7 @@ final class PaymentService implements PaymentServiceContract
                 if (!$this->gateways->has($payment->provider())) {
                     throw new ServiceException('payment.provider.unconfigured', layer: 'service.payment');
                 }
-                $outcome = $this->reconcile($payment, $this->gateways->get($payment->provider()), null);
+                $outcome = $this->reconcile($payment, $this->gateways->get($payment->provider()), null, 'reconcile');
             } catch (\Throwable $e) {
                 // No answer is not an answer: never expire on an error.
                 $counts['errors']++;
@@ -429,6 +464,17 @@ final class PaymentService implements PaymentServiceContract
         }
 
         $reference = (string) $payment->reference();
+        $this->journalFor($payment, 'payment.created', null, [
+            'status_to' => PaymentStatus::Pending->value,
+            'detail'    => sprintf(
+                '%s %s %s %s%s',
+                $payment->direction()->value,
+                $payment->method()->value,
+                $payment->amount()->toMajor(),
+                $payment->amount()->currency,
+                $payment->subjectType() !== null ? " for {$payment->subjectType()}:{$payment->subjectId()}" : '',
+            ),
+        ]);
         $callback  = $this->callbackUrl($gateway->name(), $callbackBaseUrl);
 
         try {
@@ -447,13 +493,17 @@ final class PaymentService implements PaymentServiceContract
                 'message'   => $e->getMessage(),
             ]);
 
+            $this->journalFor($payment, 'provider.rejected', 'create', [
+                'detail' => trim(($e->errorCode !== '' ? "[{$e->errorCode}] " : '') . $e->getMessage()),
+            ]);
+
             // DUPLICATE_REFERENCE means the provider already HAS this reference —
             // the one refusal that does not prove nothing moved.
             if ($e->errorCode === 'DUPLICATE_REFERENCE') {
                 throw PaymentException::outcomeUnknown($reference, $e->errorCode, $e->getMessage(), $e);
             }
 
-            $this->transition($payment, PaymentStatus::Failed, null, $e->errorCode, $e->getMessage());
+            $this->transition($payment, PaymentStatus::Failed, null, $e->errorCode, $e->getMessage(), 'create');
             throw PaymentException::rejected($reference, $e->errorCode, $e->getMessage(), $e->errors, $e);
         } catch (GatewayException $e) {
             $this->logger?->warning('Payment request outcome unknown; left pending', [
@@ -461,20 +511,28 @@ final class PaymentService implements PaymentServiceContract
                 'provider'  => $gateway->name(),
                 'error'     => $e->getMessage(),
             ]);
+            $this->journalFor($payment, 'provider.unreachable', 'create', [
+                'detail' => 'No answer from the provider — left pending until a callback or a check settles it. ' . $e->getMessage(),
+            ]);
             throw PaymentException::providerUnavailable($reference, $e);
         }
 
         $payment->acceptedByProvider($result->providerUuid, $result->providerReference, $result->redirectUrl);
+        $this->journalFor($payment, 'provider.accepted', 'create', [
+            'provider_uuid' => $result->providerUuid,
+            'detail'        => trim('Provider status: ' . $result->status->value
+                . ($result->providerReference !== null ? " · provider reference {$result->providerReference}" : '')),
+        ]);
 
         if ($result->status === PaymentStatus::Failed || $result->status === PaymentStatus::Cancelled) {
-            $this->transition($payment, $result->status, $result->providerTransactionId, $result->failureCode, $result->failureMessage);
+            $this->transition($payment, $result->status, $result->providerTransactionId, $result->failureCode, $result->failureMessage, 'create');
         } else {
             $this->write($payment, fn(): bool => $this->store->update($payment, PaymentStatus::Pending));
 
             // "Completed" on create is not proof — confirm it before announcing.
             if ($result->status === PaymentStatus::Succeeded && $result->providerUuid !== null) {
                 try {
-                    $this->reconcile($payment, $gateway, null);
+                    $this->reconcile($payment, $gateway, null, 'create');
                 } catch (GatewayException) {
                     // Stays pending; the webhook or reconcilePending() confirms it.
                 }
@@ -491,7 +549,7 @@ final class PaymentService implements PaymentServiceContract
      * @return 'settled'|'pending'|'unverifiable'|'unchanged'
      * @throws GatewayException when the provider cannot be asked
      */
-    private function reconcile(Payment $payment, PaymentGateway $gateway, ?string $uuidHint): string
+    private function reconcile(Payment $payment, PaymentGateway $gateway, ?string $uuidHint, string $via): string
     {
         $storedUuid = $payment->providerUuid();
         $uuid       = $storedUuid ?? $uuidHint;
@@ -523,6 +581,12 @@ final class PaymentService implements PaymentServiceContract
                 'reported'  => $reported,
                 'uuid'      => $uuid,
             ]);
+            $this->journalFor($payment, 'check.unverifiable', $via, [
+                'provider_uuid' => $uuid,
+                'detail'        => $reported !== null
+                    ? "Provider status names another reference ({$reported}); not applied."
+                    : 'Provider status carries no reference to prove it is this payment; not applied.',
+            ]);
             $this->touch($payment);
 
             return 'unverifiable';
@@ -553,6 +617,11 @@ final class PaymentService implements PaymentServiceContract
                 'stored'    => $current->value,
                 'provider'  => $target->value,
             ]);
+            $this->journalFor($payment, 'check.contradicted', $via, [
+                'status_from' => $current->value,
+                'status_to'   => $target->value,
+                'detail'      => "Provider reports {$target->value} for a payment stored as {$current->value}; not applied — check it with the provider.",
+            ]);
             $this->touch($payment);
 
             return 'unchanged';
@@ -570,12 +639,19 @@ final class PaymentService implements PaymentServiceContract
                 'expected'  => $payment->amount()->toMajor() . ' ' . $payment->amount()->currency,
                 'reported'  => $result->amount->toMajor() . ' ' . $result->amount->currency,
             ]);
+            $this->journalFor($payment, 'check.unverifiable', $via, [
+                'detail' => sprintf(
+                    'Provider reports %s %s paid, expected %s %s; not settled.',
+                    $result->amount->toMajor(), $result->amount->currency,
+                    $payment->amount()->toMajor(), $payment->amount()->currency,
+                ),
+            ]);
             $this->touch($payment);
 
             return 'unverifiable';
         }
 
-        $this->transition($payment, $target, $result->providerTransactionId, $result->failureCode, $result->failureMessage);
+        $this->transition($payment, $target, $result->providerTransactionId, $result->failureCode, $result->failureMessage, $via);
 
         return 'settled';
     }
@@ -601,7 +677,7 @@ final class PaymentService implements PaymentServiceContract
             return 'review';
         }
 
-        $this->transition($payment, PaymentStatus::Expired, null, 'payment.expired', 'No confirmation from the provider in time.');
+        $this->transition($payment, PaymentStatus::Expired, null, 'payment.expired', 'No confirmation from the provider in time.', 'expiry');
 
         return 'expired';
     }
@@ -615,6 +691,7 @@ final class PaymentService implements PaymentServiceContract
         ?string $providerTransactionId,
         ?string $failureCode,
         ?string $failureMessage,
+        string $via,
     ): bool {
         $from = $payment->status();
         $now  = $this->clock->now();
@@ -639,6 +716,14 @@ final class PaymentService implements PaymentServiceContract
         if (!$this->write($payment, fn(): bool => $this->store->update($payment, $from))) {
             return false; // another process got there first — and announces it
         }
+
+        $this->journalFor($payment, 'status.changed', $via, [
+            'status_from' => $from->value,
+            'status_to'   => $to->value,
+            'detail'      => $failureMessage !== null || $failureCode !== null
+                ? trim(($failureCode !== null ? "[{$failureCode}] " : '') . ($failureMessage ?? ''))
+                : ($providerTransactionId !== null ? "Transaction {$providerTransactionId}" : null),
+        ]);
 
         $this->announce($payment);
 
@@ -681,6 +766,14 @@ final class PaymentService implements PaymentServiceContract
                 'listeners' => array_keys($failures),
                 'errors'    => array_map(static fn(\Throwable $e): string => mb_substr($e->getMessage(), 0, 200), array_values($failures)),
             ];
+            $this->journalFor($payment, 'announce.failed', null, [
+                'detail' => sprintf(
+                    'Attempt %d: listener(s) %s failed — %s',
+                    $payment->notifyAttempts(),
+                    implode(', ', array_keys($failures)),
+                    implode(' | ', $context['errors']),
+                ),
+            ]);
             if ($payment->notifyAttempts() >= $this->notifyMaxAttempts) {
                 // The outbox stops retrying here. Money moved (or failed to) and
                 // the application still does not know: a person has to act, then
@@ -696,6 +789,63 @@ final class PaymentService implements PaymentServiceContract
         $this->write($payment, fn(): bool => $this->store->update($payment, $payment->status()));
 
         return $failures === [];
+    }
+
+    // ── Internals: the journal ────────────────────────────────────────────────
+
+    /**
+     * Write one journal row about a payment. Never throws: the history must
+     * not be able to stop the money.
+     *
+     * @param array<string, ?string> $fields
+     */
+    private function journalFor(Payment $payment, string $kind, ?string $via, array $fields = []): void
+    {
+        // $fields first: a caller-given provider_uuid (a callback's) wins over
+        // the stored one, which may not be set yet.
+        $this->journal($fields + [
+            'reference'     => (string) $payment->reference(),
+            'provider'      => $payment->provider(),
+            'kind'          => $kind,
+            'via'           => $via,
+            'provider_uuid' => $payment->providerUuid(),
+        ]);
+    }
+
+    /**
+     * @param array<string, ?string> $entry
+     * @return ?int the row id, or null when there is no journal or the write failed
+     */
+    private function journal(array $entry): ?int
+    {
+        if ($this->journal === null) {
+            return null;
+        }
+
+        try {
+            return $this->journal->record($entry);
+        } catch (\Throwable $e) {
+            $this->logger?->warning('Payment journal write failed', [
+                'kind'      => $entry['kind'] ?? '',
+                'reference' => $entry['reference'] ?? null,
+                'error'     => $e->getMessage(),
+            ]);
+
+            return null;
+        }
+    }
+
+    private function resolveJournal(?int $id, string $outcome, ?string $reference = null, ?string $detail = null): void
+    {
+        if ($id === null || $this->journal === null) {
+            return;
+        }
+
+        try {
+            $this->journal->resolve($id, $outcome, $reference, $detail);
+        } catch (\Throwable $e) {
+            $this->logger?->warning('Payment journal update failed', ['id' => $id, 'error' => $e->getMessage()]);
+        }
     }
 
     /** Record that the provider was consulted, so polls and reconciliation rotate. */

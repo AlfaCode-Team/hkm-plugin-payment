@@ -25,6 +25,11 @@ final readonly class PaymentQuery
         public ?\DateTimeImmutable $to = null,
         int $page = 1,
         int $perPage = 25,
+        /**
+         * Since 1.1.0: one box an operator types into — our reference, the
+         * provider's reference or uuid (exact), or part of a phone number.
+         */
+        public ?string $search = null,
     ) {
         $this->page    = max(1, $page);
         $this->perPage = max(1, min(self::MAX_PER_PAGE, $perPage));
@@ -62,6 +67,7 @@ final readonly class PaymentQuery
             to:          $date($input['to'] ?? null),
             page:        (int) ($input['page'] ?? 1),
             perPage:     (int) ($input['per_page'] ?? 25),
+            search:      $str($input['search'] ?? $input['q'] ?? null),
         );
     }
 

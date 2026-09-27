@@ -6,6 +6,38 @@ All notable changes to this plugin are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-28
+
+### Added
+
+- **Activity journal** — `payment_events`, written by `PaymentService` as it goes:
+  `payment.created`, `provider.accepted` / `provider.rejected` /
+  `provider.unreachable`, `status.changed` (from → to, and `via` what proved it:
+  `create`, `webhook`, `poll`, `check`, `reconcile`, `expiry`),
+  `check.unverifiable` / `check.contradicted` (a provider answer that was not
+  applied, and why), `announce.failed`, and one `webhook.received` row per
+  callback with its `outcome` (`applied`, `already_settled`, `unknown_payment`,
+  `invalid_signature`, `unreadable`, `throttled`, `provider_unreachable`,
+  `no_change`, `unverifiable`), event name and body (capped at 16 KB; 2 KB for
+  an unsigned one). Callbacks naming no known payment, and those with a bad
+  signature, are kept too. Plain "still pending" checks are not journalled.
+  Journal writes are best-effort: a failure is logged and never stops a payment.
+- `PaymentActivityContract` (read-only, `PAYMENT_ADMIN_PERMISSION`):
+  `timeline($reference)`, `webhooks($page, $perPage, $outcome)`,
+  `statusCounts($direction)`.
+- `PaymentQuery::$search` — our reference, the provider's reference or uuid
+  (exact), or phone digits (a leading local `0` is ignored).
+- `PaymentDTO` gains `providerReference`, `previousStatus`, `initiatedBy`,
+  `lastCheckedAt`, `notifiedAt`, `notifyAttempts` (trailing, defaulted).
+- Migration `2026_09_28_000004_create_payment_events_table` in both
+  `database/migrations` and `database/tenant-template`.
+
+### Changed
+
+- `PaymentStore` (an internal port) gains `statusCounts()`. Only a class that
+  implements that port itself needs updating; `PaymentServiceContract` is
+  unchanged.
+
 ## [1.0.0] - 2026-09-27
 
 ### Added

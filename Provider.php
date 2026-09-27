@@ -20,10 +20,12 @@ use AlfacodeTeam\PhpServicePlatform\Kernel\Ports\LoggerPort;
 use AlfacodeTeam\PhpServicePlatform\Kernel\Ports\SystemClock;
 use AlfacodeTeam\PhpServicePlatform\Kernel\Security\Identity;
 use Plugins\Payment\API\Contracts\MarzPayServiceContract;
+use Plugins\Payment\API\Contracts\PaymentActivityContract;
 use Plugins\Payment\API\Contracts\PaymentServiceContract;
 use Plugins\Payment\API\Contracts\PhoneNumberServiceContract;
 use Plugins\Payment\Application\Gateway\GatewayRegistry;
 use Plugins\Payment\Application\Services\MarzPayService;
+use Plugins\Payment\Application\Services\PaymentActivityService;
 use Plugins\Payment\Application\Services\PaymentService;
 use Plugins\Payment\Application\Services\PhoneNumberService;
 use Plugins\Payment\Domain\ValueObjects\Money;
@@ -31,6 +33,7 @@ use Plugins\Payment\Infrastructure\Cli\ReconcilePaymentsCommand;
 use Plugins\Payment\Infrastructure\Gateways\MarzPay\MarzPayClient;
 use Plugins\Payment\Infrastructure\Gateways\MarzPay\MarzPayGateway;
 use Plugins\Payment\Infrastructure\Http\Stages\StatusRateLimitStage;
+use Plugins\Payment\Infrastructure\Persistence\PaymentJournalRepository;
 use Plugins\Payment\Infrastructure\Persistence\PaymentRepository;
 use Plugins\Payment\Infrastructure\Persistence\PhoneNumberRepository;
 
@@ -71,7 +74,7 @@ final class Provider implements ModuleContract
     /** @return list<class-string> */
     public function exposes(): array
     {
-        return [PaymentServiceContract::class, PhoneNumberServiceContract::class, MarzPayServiceContract::class];
+        return [PaymentServiceContract::class, PhoneNumberServiceContract::class, MarzPayServiceContract::class, PaymentActivityContract::class];
     }
 
     public function register(ModuleContainer $container): void
@@ -103,6 +106,20 @@ final class Provider implements ModuleContract
         // the central one otherwise. See PaymentRepository for why.
         $container->bind(PaymentServiceContract::class, static fn(ModuleContainer $c) =>
             self::paymentService($c, $c->make(DatabasePort::class), static fn(string $id): mixed => $c->make($id)));
+
+        // Read-only operator view: each payment's history and every callback
+        // (payment_events). Same connection as the payments it describes.
+        $container->bind(PaymentActivityContract::class, static function (ModuleContainer $c): PaymentActivityService {
+            $db    = $c->make(DatabasePort::class);
+            $clock = self::clock($c);
+
+            return new PaymentActivityService(
+                journal:         new PaymentJournalRepository($db, $clock),
+                store:           new PaymentRepository($db, $clock),
+                identity:        self::identity($c),
+                adminPermission: self::env('PAYMENT_ADMIN_PERMISSION', 'payment:manage', allowEmpty: true),
+            );
+        });
 
         $container->bind(PhoneNumberServiceContract::class, static fn(ModuleContainer $c) =>
             self::phoneNumberService($c, $c->make(DatabasePort::class), static fn(string $id): mixed => $c->make($id)));
@@ -221,6 +238,7 @@ final class Provider implements ModuleContract
             notifyMaxAttempts:   max(1, (int) self::env('PAYMENT_NOTIFY_MAX_ATTEMPTS', '10')),
             phones:              new PhoneNumberRepository($db, $clock),
             withdrawRequiresVerified: self::bool('PAYMENT_WITHDRAW_REQUIRE_VERIFIED', true),
+            journal:             new PaymentJournalRepository($db, $clock),
         );
     }
 

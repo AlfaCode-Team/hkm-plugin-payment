@@ -67,4 +67,11 @@ interface PaymentStore
 
     /** @return array{items: list<Payment>, total: int} */
     public function search(PaymentQuery $query): array;
+
+    /**
+     * Payments per status, optionally for one direction.
+     *
+     * @return array<string, int> status => count, only statuses that occur
+     */
+    public function statusCounts(?string $direction): array;
 }

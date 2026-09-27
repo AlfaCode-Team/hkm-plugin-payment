@@ -354,9 +354,42 @@ prefer `PhoneNumberServiceContract` for phone checks: it is normalised and limit
 `MARZPAY_WEBHOOK_SECRET` adds HMAC verification on top: `t={unix},v1={hex}` over
 `"{t}.{raw body}"`, a 5-minute replay window and constant-time comparison.
 
+## What happened to a payment — the activity journal
+
+Since 1.1.0 every step is also written to `payment_events`, so an operator can
+read a payment's whole history, not just its current status:
+
+```
+payment.created        pending, "collection mobile_money 1.00 USD for resource.purchase:…"
+provider.accepted      MarzPay's uuid and reference
+webhook.received       outcome: applied        (the body, as received)
+status.changed         pending → succeeded  via webhook
+```
+
+Every callback gets a row, **including** those naming no payment this database
+knows (`unknown_payment`) and those with a bad signature (`invalid_signature`) —
+the ones an operator most needs to see. `via` on a status change says what
+proved it: `create`, `webhook`, `poll` (a checkout's status poll), `check`
+(`refresh()`), `reconcile` (`payments:reconcile`) or `expiry`.
+
+Read it through `PaymentActivityContract` (admin permission):
+
+```php
+$activity->timeline($reference);                    // oldest first
+$activity->webhooks(page: 1, perPage: 25, outcome: 'unknown_payment');
+$activity->statusCounts('collection');              // ['pending' => 3, 'succeeded' => 41, …]
+$payments->search(new PaymentQuery(search: '0812345678'));   // reference, provider ref, or phone
+```
+
+The journal is history, `payments` is the truth: a journal write that fails is
+logged and never stops a payment. A payment still pending on a poll is not
+journalled each time — only what changed, or what could not be applied.
+The body of a callback can carry the payer's phone number; treat the table like
+`payments`.
+
 ## Where the data lives
 
-Two tables, `payments` and `payment_phone_numbers`, are written through the
+Three tables, `payments`, `payment_events` and `payment_phone_numbers`, are written through the
 **request's** `DatabasePort`. Their migrations are in both `database/migrations` and
 `database/tenant-template`.
 On a Tenancy project, that is the tenant database of the host the request arrived on.

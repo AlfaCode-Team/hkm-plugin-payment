@@ -186,6 +186,26 @@ final class PaymentRepository implements PaymentStore
             $where[]      = 'created_at <= :to';
             $params['to'] = self::ts($query->to);
         }
+        $search = $query->search !== null ? mb_substr(trim($query->search), 0, 120) : '';
+        if ($search !== '') {
+            // References are matched exactly (they are ids, and an index serves
+            // them); a phone number by its digits anywhere. Numbers are stored
+            // E.164 (+243812…) but people type them the local way (0812…), so
+            // one leading 0 — the national trunk prefix — is dropped first. The
+            // LIKE pattern is escaped: % and _ typed into the box are literal
+            // characters, not wildcards.
+            $digits = preg_replace('/\D+/', '', $search) ?? '';
+            if (str_starts_with($digits, '0')) {
+                $digits = substr($digits, 1);
+            }
+            $or     = ['reference = :s_ref', 'provider_reference = :s_pref', 'provider_uuid = :s_uuid'];
+            $params += ['s_ref' => strtolower($search), 's_pref' => $search, 's_uuid' => $search];
+            if (\strlen($digits) >= 3) {
+                $or[]             = "phone_number LIKE :s_phone ESCAPE '!'";
+                $params['s_phone'] = '%' . strtr($digits, ['!' => '!!', '%' => '!%', '_' => '!_']) . '%';
+            }
+            $where[] = '(' . implode(' OR ', $or) . ')';
+        }
         $clause = implode(' AND ', $where);
 
         try {
@@ -198,6 +218,25 @@ final class PaymentRepository implements PaymentStore
             'items' => $this->many($clause, $params, 'created_at DESC, id DESC', $query->perPage, $query->offset()),
             'total' => $total,
         ];
+    }
+
+    public function statusCounts(?string $direction): array
+    {
+        $where  = $direction !== null ? 'WHERE direction = :direction' : '';
+        $params = $direction !== null ? ['direction' => $direction] : [];
+
+        try {
+            $rows = $this->db->query("SELECT status, COUNT(*) AS n FROM {$this->table} {$where} GROUP BY status", $params);
+        } catch (\PDOException $e) {
+            throw new RepositoryException('Failed to count payments by status', layer: 'repository.payment', previous: $e);
+        }
+
+        $counts = [];
+        foreach ($rows as $row) {
+            $counts[(string) $row['status']] = (int) $row['n'];
+        }
+
+        return $counts;
     }
 
     // ── Internals ─────────────────────────────────────────────────────────────

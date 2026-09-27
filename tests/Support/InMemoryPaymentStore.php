@@ -129,6 +129,18 @@ final class InMemoryPaymentStore implements PaymentStore
         ];
     }
 
+    public function statusCounts(?string $direction): array
+    {
+        $counts = [];
+        foreach ($this->rows as $p) {
+            if ($direction === null || $p->direction()->value === $direction) {
+                $counts[$p->status()->value] = ($counts[$p->status()->value] ?? 0) + 1;
+            }
+        }
+
+        return $counts;
+    }
+
     /** Settle the stored row behind the service's back — simulates a concurrent writer. */
     public function settleBehindTheScenes(string $reference, PaymentStatus $status, \DateTimeImmutable $at): void
     {

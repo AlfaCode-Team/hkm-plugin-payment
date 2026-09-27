@@ -41,6 +41,17 @@ final readonly class PaymentDTO
         public ?string $bankAccountNumber = null,
         public ?string $bankAccountName = null,
         public ?string $bankBranch = null,
+        // Since 1.1.0 — for an operator's view of the payment. Trailing and
+        // defaulted, so every existing `new PaymentDTO(...)` still compiles.
+        /** The provider's OWN reference (MarzPay's, as its dashboard shows it). */
+        public ?string $providerReference = null,
+        public ?string $previousStatus = null,
+        /** Identity userId of whoever started it; null for a guest. */
+        public ?string $initiatedBy = null,
+        public ?string $lastCheckedAt = null,
+        /** When the current status was announced to listeners; null = still in the outbox. */
+        public ?string $notifiedAt = null,
+        public int $notifyAttempts = 0,
     ) {
     }
 
@@ -72,6 +83,12 @@ final readonly class PaymentDTO
             bankAccountNumber:     $p->bankAccount()?->accountNumber,
             bankAccountName:       $p->bankAccount()?->accountName,
             bankBranch:            $p->bankAccount()?->branch,
+            providerReference:     $p->providerReference(),
+            previousStatus:        $p->previousStatus()?->value,
+            initiatedBy:           $p->initiatedBy(),
+            lastCheckedAt:         $p->lastCheckedAt()?->format(\DateTimeInterface::RFC3339),
+            notifiedAt:            $p->notifiedAt()?->format(\DateTimeInterface::RFC3339),
+            notifyAttempts:        $p->notifyAttempts(),
         );
     }
 
@@ -114,6 +131,12 @@ final readonly class PaymentDTO
             'bank_account_number'     => $this->bankAccountNumber,
             'bank_account_name'       => $this->bankAccountName,
             'bank_branch'             => $this->bankBranch,
+            'provider_reference'      => $this->providerReference,
+            'previous_status'         => $this->previousStatus,
+            'initiated_by'            => $this->initiatedBy,
+            'last_checked_at'         => $this->lastCheckedAt,
+            'notified_at'             => $this->notifiedAt,
+            'notify_attempts'         => $this->notifyAttempts,
         ];
     }
 
