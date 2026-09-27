@@ -1,0 +1,174 @@
+{
+    "name": "payment",
+    "version": "1.0.0",
+    "kernel": "^1.13.1",
+    "solves": "payment.processing",
+    "type": "module",
+    "requires": [
+        "database.management",
+        "http.client"
+    ],
+    "exposes": [
+        "Plugins\\Payment\\API\\Contracts\\PaymentServiceContract",
+        "Plugins\\Payment\\API\\Contracts\\PhoneNumberServiceContract",
+        "Plugins\\Payment\\API\\Contracts\\MarzPayServiceContract"
+    ],
+    "lang": {
+        "path": "resources/lang",
+        "namespace": "payment",
+        "global": false
+    },
+    "routePrefix": "/api/payments",
+    "routes": [
+        {
+            "method": "POST",
+            "path": "/webhooks/{provider:slug}",
+            "handler": "Plugins\\Payment\\Infrastructure\\Http\\Controllers\\WebhookController@receive",
+            "name": "payment.webhook"
+        },
+        {
+            "method": "GET",
+            "path": "/{reference:uuid}",
+            "handler": "Plugins\\Payment\\Infrastructure\\Http\\Controllers\\PaymentStatusController@show",
+            "name": "payment.status",
+            "filters": [
+                "payment.rate_limit:60"
+            ]
+        }
+    ],
+    "emits": [
+        "payment.succeeded",
+        "payment.failed",
+        "payment.cancelled",
+        "payment.expired",
+        "payment.reversed",
+        "payout.succeeded",
+        "payout.failed",
+        "payout.cancelled",
+        "payout.expired",
+        "payout.reversed"
+    ],
+    "listens": [],
+    "documentation": "Provider-agnostic payments ledger with MarzPay as the first driver (UG, KE, RW, CD, ZM, CM, BJ, CI, GA, CG, SN, SL). PaymentServiceContract collects (mobile money or card) and sends money out — payout() to any mobile-money number, withdraw() to an owner's saved and verified number, transfer() to a bank account (UG) — under a separate payout permission with per-payout and daily caps; it also looks payments up by subject and searches them. PhoneNumberServiceContract checks numbers (format per market, optional subscriber-name lookup, UG) and keeps each owner's saved numbers (payment_phone_numbers: add, verify, rename, default, remove); lookups are capped per actor per day (PAYMENT_PHONE_LOOKUPS_PER_DAY, needs a CachePort). Every movement is written to `payments` BEFORE the provider is called and changes status only when the provider's API confirms it — a webhook is a doorbell, re-checked against GET /transactions/{uuid} with reference and amount verified. Status changes are compare-and-set and announced as PaymentSettledIntegrationEvent (payment.* / payout.* : succeeded, failed, cancelled, expired, reversed) at least once, via an outbox that reconcilePending() / `hkm payments:reconcile` redelivers. One live payment per subject (UNIQUE exclusive_key). Webhook: POST /api/payments/webhooks/marzpay (CSRF-exempt it; HMAC-verified when MARZPAY_WEBHOOK_SECRET is set; per-payment throttle). Status poll: GET /api/payments/{reference} (rate-limited via the plugin's own payment.rate_limit filter when a CachePort is bound). MarzPayServiceContract: bills, airtime, bank list/validation, raw phone verification, payment links, webhooks, WhatsApp/USSD (admin permission, not ledger-tracked). Rows live in the request's database (the tenant database under Tenancy; run `hkm payments:reconcile --all-tenants`).",
+    "config": [
+        {
+            "key": "MARZPAY_API_KEY",
+            "type": "string",
+            "required": true
+        },
+        {
+            "key": "MARZPAY_API_SECRET",
+            "type": "string",
+            "required": true
+        },
+        {
+            "key": "MARZPAY_API_BASE",
+            "type": "string",
+            "required": false,
+            "default": "https://wallet.wearemarz.com/api/v1"
+        },
+        {
+            "key": "MARZPAY_WEBHOOK_SECRET",
+            "type": "string",
+            "required": false
+        },
+        {
+            "key": "MARZPAY_TIMEOUT",
+            "type": "int",
+            "required": false,
+            "default": 60
+        },
+        {
+            "key": "PAYMENT_DEFAULT_PROVIDER",
+            "type": "string",
+            "required": false,
+            "default": "marzpay"
+        },
+        {
+            "key": "PAYMENT_DEFAULT_COUNTRY",
+            "type": "string",
+            "required": false,
+            "default": "UG"
+        },
+        {
+            "key": "PAYMENT_CALLBACK_BASE_URL",
+            "type": "string",
+            "required": false
+        },
+        {
+            "key": "PAYMENT_ADMIN_PERMISSION",
+            "type": "string",
+            "required": false,
+            "default": "payment:manage"
+        },
+        {
+            "key": "PAYMENT_PAYOUT_PERMISSION",
+            "type": "string",
+            "required": false,
+            "default": "payment:payout"
+        },
+        {
+            "key": "PAYMENT_PAYOUT_MAX",
+            "type": "string",
+            "required": false
+        },
+        {
+            "key": "PAYMENT_PAYOUT_DAILY_MAX",
+            "type": "string",
+            "required": false
+        },
+        {
+            "key": "PAYMENT_STATUS_REFRESH_SECONDS",
+            "type": "int",
+            "required": false,
+            "default": 15
+        },
+        {
+            "key": "PAYMENT_WEBHOOK_MIN_INTERVAL",
+            "type": "int",
+            "required": false,
+            "default": 5
+        },
+        {
+            "key": "PAYMENT_PENDING_TTL_MINUTES",
+            "type": "int",
+            "required": false,
+            "default": 60
+        },
+        {
+            "key": "PAYMENT_NOTIFY_MAX_ATTEMPTS",
+            "type": "int",
+            "required": false,
+            "default": 10
+        },
+        {
+            "key": "PAYMENT_ALLOW_HTTP_CALLBACK",
+            "type": "bool",
+            "required": false,
+            "default": false
+        },
+        {
+            "key": "MARZPAY_CHECKOUT_HOSTS",
+            "type": "string",
+            "required": false
+        },
+        {
+            "key": "PAYMENT_WITHDRAW_REQUIRE_VERIFIED",
+            "type": "bool",
+            "required": false,
+            "default": true
+        },
+        {
+            "key": "PAYMENT_PHONE_MAX_PER_OWNER",
+            "type": "int",
+            "required": false,
+            "default": 10
+        },
+        {
+            "key": "PAYMENT_PHONE_LOOKUPS_PER_DAY",
+            "type": "int",
+            "required": false,
+            "default": 10
+        }
+    ]
+}

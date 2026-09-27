@@ -1,0 +1,56 @@
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Textes français du plugin Payment — lus sous `payment::messages.<clé>`.
+ */
+return [
+    'rejected'             => 'Le paiement n\'a pas pu être traité. Veuillez réessayer plus tard.',
+    'rejected_invalid'     => 'Les informations de paiement n\'ont pas été acceptées. Vérifiez-les et réessayez.',
+    'rejected_phone'       => 'Ce numéro de téléphone ne peut pas être utilisé pour ce paiement.',
+    'outcome_unknown'      => 'Le statut du paiement n\'est pas encore connu. Il sera confirmé automatiquement.',
+    'already_pending'      => 'Un paiement est déjà en cours pour cet élément.',
+    'already_paid'         => 'Cet élément a déjà été payé.',
+    'payout_limit'         => 'Les versements sont limités à :limit :currency chacun.',
+    'payout_daily_limit'   => 'Ce versement dépasserait la limite quotidienne de :limit :currency.',
+    'throttled'            => 'Trop de demandes pour ce paiement. Réessayez dans quelques secondes.',
+    'rate_limited'         => 'Trop de vérifications de statut. Réessayez dans une minute.',
+    'payout_in_flight'     => 'Un autre versement est encore en cours. Réessayez une fois qu\'il sera terminé.',
+    'provider_unavailable' => 'Le prestataire de paiement est injoignable. Le paiement est en attente et sera confirmé automatiquement.',
+    'provider_unreachable' => 'Le prestataire de paiement est injoignable. Vérifiez le statut de la transaction avant de réessayer.',
+    'unknown_provider'     => 'Prestataire de paiement inconnu [:provider].',
+    'not_found'            => 'Paiement [:reference] introuvable.',
+    'invalid_signature'    => 'Signature du webhook invalide.',
+    'forbidden'            => 'Vous n\'êtes pas autorisé à gérer les paiements.',
+    'phone_not_found'      => 'Ce numéro de téléphone n\'est pas enregistré.',
+    'phone_not_verified'   => 'Vérifiez ce numéro de téléphone avant d\'y effectuer un retrait.',
+    'phone_failed'         => 'Ce numéro de téléphone n\'a pas pu être vérifié ; aucun envoi d\'argent n\'y est possible.',
+    'phone_limit'          => 'Au plus :max numéros de téléphone peuvent être enregistrés. Supprimez-en un d\'abord.',
+    'lookup_limit'         => 'Trop de vérifications de numéros aujourd\'hui. Réessayez demain.',
+    'bank_transfer_unavailable' => 'Les virements bancaires ne sont pas disponibles pour :country.',
+
+    'validation' => [
+        'market'          => 'Ce pays ou cette devise n\'est pas pris en charge.',
+        'amount'          => 'Montant invalide pour cette devise.',
+        'phone'           => 'Numéro de téléphone invalide pour ce pays (format international, ex. +256712345678).',
+        'payment'         => 'Ce paiement n\'est pas valide.',
+        'method'          => 'Moyen de paiement non pris en charge [:method].',
+        'phone_required'  => 'Un numéro de téléphone est requis.',
+        'too_long'        => 'Au plus :max caractères.',
+        'metadata_count'  => 'Au plus :max entrées de métadonnées sont autorisées.',
+        'metadata'        => 'Les métadonnées doivent être des paires clé → valeur simples (clés de 40 caractères, valeurs de 255 au plus).',
+        'required'        => 'Ce champ est obligatoire.',
+        'reference'       => 'Référence invalide.',
+        'utility'         => 'Service non pris en charge [:utility]. Utilisez LIGHT, NWSC, DSTV ou GOTV.',
+        'bouquet_utility' => 'Les bouquets n\'existent que pour dstv et gotv.',
+        'status'          => 'Statut de paiement inconnu.',
+        'direction'       => 'La direction doit être collection ou payout.',
+        'pii_keys'        => 'Chaque clé PII doit être une clé des métadonnées.',
+        'https'           => 'L\'URL doit utiliser https.',
+        'action'          => 'Action inconnue [:action].',
+        'bank_account'    => 'Coordonnées bancaires invalides.',
+        'label'           => 'Le libellé doit faire au plus 60 caractères.',
+        'owner'           => 'Le propriétaire est obligatoire.',
+    ],
+];
