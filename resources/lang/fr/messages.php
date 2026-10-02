@@ -28,6 +28,14 @@ return [
     'phone_failed'         => 'Ce numéro de téléphone n\'a pas pu être vérifié ; aucun envoi d\'argent n\'y est possible.',
     'phone_limit'          => 'Au plus :max numéros de téléphone peuvent être enregistrés. Supprimez-en un d\'abord.',
     'lookup_limit'         => 'Trop de vérifications de numéros aujourd\'hui. Réessayez demain.',
+    'not_awaiting_approval' => 'Ce retrait n\'attend pas d\'approbation (il est :status).',
+    'approver_required'    => 'Un administrateur connecté doit approuver les retraits.',
+    'own_withdrawal'       => 'Vous ne pouvez pas approuver ni refuser votre propre retrait.',
+    'approval_required'    => 'Toute sortie d\'argent doit être approuvée par un administrateur — utilisez withdraw(), payout() ou transfer().',
+    'requester_required'   => 'Connectez-vous pour demander un retrait.',
+    'payout_minimum'       => 'Le plus petit montant pouvant être envoyé est :minimum :currency.',
+    'payout_currency'      => 'Les versements en :currency ne sont pas activés.',
+    'phone_name_mismatch'  => 'Ce numéro de téléphone est enregistré au nom d\'une autre personne.',
     'bank_transfer_unavailable' => 'Les virements bancaires ne sont pas disponibles pour :country.',
 
     'validation' => [

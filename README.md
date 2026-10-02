@@ -43,21 +43,27 @@ Requires the `database.management` and `http.client` plugins, and kernel `^1.13.
 |---|---|---|
 | `MARZPAY_API_KEY` / `MARZPAY_API_SECRET` | — **required** | Dashboard → API Keys. The boot fails until both are set. |
 | `MARZPAY_API_BASE` | `https://wallet.wearemarz.com/api/v1` | |
-| `MARZPAY_WEBHOOK_SECRET` | *(unset)* | When set, every callback must carry a valid `X-MarzPay-Signature`. Set it in production if your account supports signing. |
+| `MARZPAY_WEBHOOK_SECRET` | *(unset)* | When set, every callback must carry a valid `X-MarzPay-Signature`. **Set it in production** (MarzPay: Business Settings → Webhooks & Security → Sign outgoing webhooks). Without it, anyone can post to the webhook. That can't settle a payment, but it costs a write and a status check. |
 | `MARZPAY_TIMEOUT` | `60` | Seconds per MarzPay call. |
-| `MARZPAY_COLLECTION_FEE_PERCENT` | `UGX:3,*:4` | MarzPay's own charge on a collection, percent per currency (`*` = every other). A status lookup may report the amount asked PLUS this fee (5,047.00 CDF asked → 5,248.88); such a payment is settled and its history notes the fee. Any other difference is still refused. |
+| `MARZPAY_COLLECTION_FEE_PERCENT` | `*:2` | **Your agreed MarzPay collection rate**, which replaces the published one. `*:2` = 2% on every collection, in every country and on every network. Scopes: `UG:2.5` (a country), `CD/vodacom:3` (a country and network), combined with commas. Set it **empty** to use MarzPay's published rates. A malformed value **stops payments** with an error. The old 1.1.2 default `UGX:3,*:4` is read as "not set". See *Fees*. |
 | `MARZPAY_CHECKOUT_HOSTS` | *(unset)* | Extra hosts a card `redirect_url` may point at. The API host is always allowed. |
 | `PAYMENT_DEFAULT_PROVIDER` / `PAYMENT_DEFAULT_COUNTRY` | `marzpay` / `UG` | |
 | `PAYMENT_CALLBACK_BASE_URL` | *(unset)* | `https://pay.example.com` — forces one host for all callbacks. |
 | `PAYMENT_ALLOW_HTTP_CALLBACK` | `false` | Allow a plain-`http` callback URL. Local development only. |
 | `PAYMENT_ADMIN_PERMISSION` | `payment:manage` | `search()`, `balance()` and every MarzPay extra. |
-| `PAYMENT_PAYOUT_PERMISSION` | `payment:payout` | `payout()`, `withdraw()` and `transfer()`. Set it **empty** to authorise them in your own code instead (a queue job with no user, or a withdrawal route that checks the user's balance first). That affects sending money only. |
+| `PAYMENT_PAYOUT_PERMISSION` | `payment:payout` | `payout()`, `withdraw()` and `transfer()`, and every MarzPay extra that spends money. Set it **empty** to authorise them in your own code instead, for example a queue job with no user. ⚠️ Empty means *any caller the code lets through, including a guest*, so only do it when your own code guards every path to these methods. |
 | `PAYMENT_PAYOUT_MAX` | *(no cap)* | Largest single payout, per currency, in major units: `UGX:5000000,KES:150000,USD:1000` |
-| `PAYMENT_PAYOUT_DAILY_MAX` | *(no cap)* | Pending plus succeeded payouts per UTC day, same format. A malformed entry **stops payouts** with an error rather than silently removing the cap. |
+| `PAYMENT_PAYOUT_DAILY_MAX` | *(no cap)* | Requested, pending and succeeded payouts per UTC day, same format. A malformed entry **stops payouts** with an error rather than silently removing the cap. **Once any cap is set, a currency the caps don't name is refused**, rather than being unlimited. |
+| `PAYMENT_PAYOUT_MIN` | *(none)* | Smallest payout, per currency, same format, e.g. `UGX:20000`. In Uganda this avoids paying MarzPay's flat UGX 1,000 fee on tiny amounts. |
 | `PAYMENT_PENDING_TTL_MINUTES` | `60` | After this, a collection nobody confirmed is `expired`. |
 | `PAYMENT_STATUS_REFRESH_SECONDS` | `15` | How often a status poll may ask MarzPay. |
-| `PAYMENT_WEBHOOK_MIN_INTERVAL` | `5` | Minimum seconds between callback-triggered MarzPay checks for one payment. A faster callback gets `429`. |
+| `PAYMENT_WEBHOOK_MIN_INTERVAL` | `5` | Minimum seconds between callback-triggered MarzPay checks for one payment. A faster callback is **acknowledged** but not checked: the checkout's status poll and `payments:reconcile` check it shortly. That way a fake callback can't make MarzPay's genuine one fail. |
+| `PAYMENT_COLLECTION_MISMATCH` | `deliver` | What happens when MarzPay confirms a collection but its amount doesn't add up. `deliver`: it **settles, so the customer gets what they paid for**, and is **flagged** for an admin to check with MarzPay. `hold`: it stays pending, the pre-1.2 behaviour. Fee-only problems never hold. See *When something doesn't add up*. |
 | `PAYMENT_NOTIFY_MAX_ATTEMPTS` | `10` | Redeliveries of one announcement before the outbox gives up on it. |
+| `PAYMENT_WITHDRAW_APPROVAL` | `self` | `self`: money is sent at once. `admin`: **every** `withdraw()`, `payout()` and `transfer()` is a **request** until an administrator approves it (see *Money out approved by an administrator*). Any other value **stops the plugin** with an error, so a typo never quietly means `self`. |
+| `PAYMENT_WITHDRAW_APPROVER_PERMISSION` | `payment:approve` | Who may approve or reject a request. |
+| `PAYMENT_APPROVAL_ABOVE` | *(none)* | Admin mode only: amounts **at or below** this go straight through, per currency, e.g. `UGX:100000`. A currency not listed always waits. |
+| `PAYMENT_PHONE_VERIFICATION_MAX_AGE_DAYS` | `0` (never) | Refuse a withdrawal to a number verified longer ago than this. SIMs change hands, so re-verify with `PhoneNumberServiceContract::verify()`. |
 | `PAYMENT_WITHDRAW_REQUIRE_VERIFIED` | `true` | `withdraw()` only pays a saved number whose name lookup succeeded. Markets with no lookup are allowed. A number whose lookup **failed** is never paid, whatever this says. |
 | `PAYMENT_PHONE_MAX_PER_OWNER` | `10` | Saved numbers per owner. |
 | `PAYMENT_PHONE_LOOKUPS_PER_DAY` | `10` | Name lookups per actor per UTC day, `0` for no limit. Counted in `CachePort`; without one there is no limit. |
@@ -123,6 +129,10 @@ them; it is in `$e->providerMessage` and the logs.
 | `payment.payout_limit` | 422 | above `PAYMENT_PAYOUT_MAX` / `_DAILY_MAX` |
 | `payment.phone_not_found` | 404 | `withdraw()` / phone book: no such saved number **for this owner** |
 | `payment.phone_not_verified` | 422 | `withdraw()` to a number not verified, or whose lookup failed |
+| `payment.not_awaiting_approval` | 409 | approving, rejecting or cancelling a request that was already decided |
+| `payment.payout_minimum` | 422 | below `PAYMENT_PAYOUT_MIN` |
+| `payment.phone_name_mismatch` | 422 | the saved number is registered to someone other than `expectedName` |
+| `payment.approval_required` (`SecurityException`) | 403 | a raw MarzPay money action under admin approval |
 | `payment.phone_limit` | 422 | the owner already has `PAYMENT_PHONE_MAX_PER_OWNER` numbers |
 | `payment.lookup_limit` | 429 | `PAYMENT_PHONE_LOOKUPS_PER_DAY` used up |
 | `payment.outcome_unknown` | 409 | MarzPay already knows the reference. **Stays pending.** |
@@ -141,10 +151,20 @@ $events->subscribe('payment.expired',   ReleaseOrderListener::class);
 ```
 
 Event names: `payment.*` for collections and `payout.*` for payouts, each one of `succeeded`,
-`failed`, `cancelled`, `expired` or `reversed`. Withdrawals and bank transfers are
-payouts, and the payload's `method` (`mobile_money`, `bank_transfer`, `card`) tells them apart. The payload carries `eventId`,
-`reference`, `method`, `subjectType`, `subjectId`, `amountMinor`, `currency`, `status`,
-`previousStatus`, `providerTransactionId`, `failureCode` and `occurredAt`.
+`failed`, `cancelled`, `expired` or `reversed`. Under admin approval, payouts also have
+`requested` and `rejected`. Withdrawals and bank transfers are payouts, and the
+payload's `method` (`mobile_money`, `bank_transfer`, `card`) tells them apart.
+
+The payload carries:
+- `eventId` and `reference`;
+- `method`, `network`, `status` and `previousStatus`;
+- `subjectType` and `subjectId`;
+- `amountMinor` and `currency`;
+- `feeMinor` and `feePaidBy`;
+- `providerTransactionId`, `failureCode` and `occurredAt`;
+- `reviewedBy`;
+- **`flagReason`**: when it is set, the payment settled but an admin must check it with
+  MarzPay, so alert someone.
 
 Three rules:
 
@@ -231,7 +251,68 @@ $payout = $payments->withdraw(new WithdrawDTO(
 The destination can't be typed in:
 - it must be a number **this owner** saved; another owner's id is a 404;
 - by default, MarzPay's lookup must have **verified** it (`PAYMENT_WITHDRAW_REQUIRE_VERIFIED`);
-- a number whose lookup **failed** is never paid.
+- a number whose lookup **failed** is never paid;
+- pass `expectedName: $user->fullName` to also require that the number is **registered to
+  that person**. A SIM that changed hands, or a number that was never theirs, is refused
+  (`payment.phone_name_mismatch`);
+- with `PAYMENT_PHONE_VERIFICATION_MAX_AGE_DAYS`, a verification older than that must be
+  redone first.
+
+### Money out approved by an administrator
+
+`PAYMENT_WITHDRAW_APPROVAL` decides whether money leaves at once:
+
+| | `self` (default) | `admin` |
+|---|---|---|
+| `withdraw()` | sent now (`pending`); needs `PAYMENT_PAYOUT_PERMISSION` | a **request** (`requested`); needs a **signed-in** user, and nothing goes to MarzPay |
+| `payout()`, `transfer()` | sent now; needs the payout permission | a **request**; needs the payout permission |
+| raw `bankTransfer()`, `whatsapp('send-money' / 'push-to-bank' / 'transfer-wallet')` | allowed with the payout permission | **refused**: they would skip approval. Use the three above |
+| Who sends the money | the caller | an admin with `PAYMENT_WITHDRAW_APPROVER_PERMISSION` |
+
+`PAYMENT_APPROVAL_ABOVE=UGX:100000` lets amounts at or below the threshold go straight
+through in admin mode. A currency not listed always waits.
+
+A request goes through every check money out does:
+- the saved, verified number of that owner, and its registered name when you pass
+  `expectedName`;
+- the minimum, per-payout and daily limits. A waiting request counts as money already
+  promised.
+- one live payout per `subjectType` + `subjectId`.
+
+It is announced as **`payout.requested`** so you can notify your admins. It waits for as
+long as it takes: reconciliation never sends it and never expires it.
+
+```php
+// WithdrawalApprovalContract — the admin screen
+$waiting = $payments->search(new PaymentQuery(status: 'requested'));
+
+$approvals->approveWithdrawal($reference, $tenantBaseUrl);        // → pending, sent to MarzPay now
+$approvals->rejectWithdrawal($reference, 'Balance under review'); // → rejected, nothing sent
+$approvals->cancelWithdrawal($reference, 'user', $userId);        // the OWNER takes it back → cancelled
+```
+
+- **Approve:** the request is **re-checked first**, because days may have passed. The
+  saved number must still exist, still belong to the owner and still be verified, and
+  **today's** limits apply. If anything fails, the request keeps waiting and the admin
+  can reject it. If everything passes, the request becomes `pending` and is sent exactly
+  as a self-service withdrawal would be. Its outcome is announced as `payout.succeeded`
+  or `payout.failed`.
+- **Reject:** the request becomes `rejected` and nothing is sent. The subject is free
+  again, and **`payout.rejected`** is announced, so release the funds you held. The
+  reason becomes `failureMessage`.
+- **Cancel:** the owner withdraws their own request while it waits. It becomes
+  `cancelled` and `payout.cancelled` is announced. Another owner's request is "not
+  found". Pass the owner from the session, never from input.
+- **Nobody decides on their own request:**
+  - the decider must be a signed-in admin with the approver permission;
+  - a request is decided once, and a second decision gets
+    `payment.not_awaiting_approval` (409);
+  - two admins approving at the same moment can't both send it.
+- **Recorded:** `reviewedBy` and `reviewedAt` are kept on the payment and on the event,
+  and the history records `withdrawal.requested`, `withdrawal.approved` and
+  `withdrawal.rejected`.
+- **Callback host:** on a Tenancy project, pass `$callbackBaseUrl` as the **tenant's**
+  host.
 
 ### `transfer()` — to a bank account (MarzPay: Uganda)
 
@@ -327,6 +408,18 @@ data: show it to the owner ("Is this you?"), and don't publish it further.
 - **Dashboard webhooks:** `webhooks()`, `createWebhook()` (https only), `webhook()`, `updateWebhook()`, `deleteWebhook()`
 - **Channels:** `whatsapp($action, $payload)` and `ussd($action, $payload)`, limited to the documented actions
 
+**Anything that spends the wallet** needs `PAYMENT_PAYOUT_PERMISSION` as well as the
+admin one, and respects `PAYMENT_PAYOUT_MAX` (UGX):
+- `bankTransfer()`, `payBill()`, `buyAirtime()` and `buyDataBundle()`;
+- `whatsapp()` with `send-money`, `push-to-bank`, `pay-utility-bill`, `pay-merchant`,
+  `pay-merchant-product` or `transfer-wallet`.
+
+`payment:manage` alone can look, but can't spend. Under
+`PAYMENT_WITHDRAW_APPROVAL=admin`, the raw bank transfer and the WhatsApp
+send/push/transfer actions are refused (`payment.approval_required`), because they would
+skip approval. A raw `bankTransfer()` is drawn from the **main** wallet unless
+`wallet_source` says otherwise.
+
 They return MarzPay's `data` object as `SKILL.md` documents it; compute with `raw`.
 They are **not in the ledger**: no row, no polling and no event. Follow up a `pending`
 bill, transfer or airtime purchase with its `*Status()` call. For bank transfers, prefer
@@ -343,9 +436,12 @@ prefer `PhoneNumberServiceContract` for phone checks: it is normalised and limit
    It can never **succeed** one.
 3. A callback is a **doorbell, not evidence**. The plugin reads
    `GET /transactions/{uuid}` using the uuid **it stored** from its own create call. It acts
-   only if that record carries this payment's reference and, for collections, the same
-   amount and currency. A forged callback can at worst trigger an early check, and even
-   that is throttled.
+   only if that record carries this payment's reference. A forged callback can at worst
+   trigger an early check, and even that is throttled.
+   - **This payment, and not paid:** MarzPay's API must say *completed* for this payment.
+     Otherwise nothing is delivered.
+   - **Paid, but the amount or fee doesn't add up:** the customer still gets what they
+     paid for, and an admin is asked to check (see *When something doesn't add up*).
 4. Every status change is a compare-and-set on the current status. When a webhook and a
    poll race, only the winner announces.
 5. The allowed transitions: `pending → succeeded | failed | cancelled | expired`,
@@ -354,6 +450,133 @@ prefer `PhoneNumberServiceContract` for phone checks: it is normalised and limit
 
 `MARZPAY_WEBHOOK_SECRET` adds HMAC verification on top: `t={unix},v1={hex}` over
 `"{t}.{raw body}"`, a 5-minute replay window and constant-time comparison.
+
+## Fees
+
+MarzPay charges differently by **country**, by **direction** (collection, payout, bank
+transfer, bill) and by **mobile-money network**. The plugin carries MarzPay's
+**published** schedule, transcribed from `wallet.wearemarz.com/pricing/{country}` on
+2026-10-02 (`MarzPayPricing`). **Your agreed rate** sits on top of it, at 2% on every
+collection by default. Payouts, bank transfers and bills use the published prices.
+
+Collections, published rate per network (your agreed 2% replaces all of these):
+
+| | MTN | Airtel | Other |
+|---|---|---|---|
+| Uganda | 3% | 3% | card 5% |
+| Kenya | | | M-Pesa: fixed fee by amount (KES 0–108) + 2% |
+| Rwanda | 4.1% | 3.5% | |
+| DRC | | 4% | Orange 4%, Vodacom (M-Pesa) 3.5% |
+| Zambia | 2% | 2% | Zamtel 2% |
+| Cameroon | 2.75% | | Orange 2.77% |
+| Benin | 3.2% | | Moov 3.2% |
+| Côte d'Ivoire | 2.8% | | Orange 3.5% |
+| Gabon | | 3% | |
+| Congo-Brazzaville | 5% | 5% | |
+| Senegal | | | Orange 3%, Free Money 3% |
+| Sierra Leone | | | Orange 4.3% |
+
+Payouts, published:
+
+| Country | Payout fee |
+|---|---|
+| Uganda | flat by amount: UGX 1,000 / 1,500 / 2,800 / 5,000 for up to 50,000 / 300,000 / 750,000 / 5,000,000 |
+| Kenya | KES 0–13 by amount, + 2% |
+| Rwanda | MTN RWF 60 + 2%, Airtel 2% |
+| DRC | Airtel 3%, Orange 2%, Vodacom 3% |
+| Zambia | Airtel 2%, MTN 3%, Zamtel 3% |
+| Cameroon | MTN 2.3%, Orange 2% |
+| Benin | MTN 2.5%, Moov 2% |
+| Côte d'Ivoire | MTN 2.3%, Orange 3% |
+| Senegal | Orange 2.8%, Free Money 2.5% |
+| Gabon, Congo-Brazzaville | 2% |
+| Sierra Leone | 3.15% |
+
+Uganda bank transfers cost UGX 5,000–16,500 by amount, and the recipient gets the full
+amount. Uganda bills cost UGX 1,200 each.
+
+### When something doesn't add up
+
+MarzPay reports `amount` (what the customer paid), `charge` (its fee) and
+`net_amount` (`amount − charge`). A collection MarzPay confirms as completed **always
+settles**, so the customer gets what they paid for. What changes is whether an admin is
+asked to look.
+
+It settles cleanly, with no flag, when one of these holds:
+
+1. **The reported amount is exactly what was asked.** The business bore the fee, which is
+   recorded with `fee_paid_by: business` when MarzPay names it.
+2. **The reported amount minus MarzPay's named `charge` is exactly what was asked.** The
+   fee was added on top for the customer (`fee_paid_by: customer`), and the history
+   records `check.fee_included`.
+3. **MarzPay named no fee, but the surplus is exactly your agreed fee for that country
+   and network** (2% by default). That counts as case 2. Rounding is allowed by one minor
+   unit, or to a whole unit of the currency.
+
+It settles **and is flagged** in these cases:
+- the amount is short ("4500 short"), in another currency, missing or unreadable;
+- a surplus nothing explains ("+201.88 = 4%; the agreed fee on airtel is 2%");
+- a named fee that doesn't add up (`amount − charge ≠ net_amount`), is in another
+  currency, or is above 10%;
+- a named fee that isn't your agreed one (`check.fee_unexpected`). Payouts get this check
+  too, against the published price.
+
+A flag puts the problem in front of an admin in four places: `flagReason` on the payment
+and on its announcement, `check.flagged` in its history, and an error in the log. The
+admin checks it with MarzPay, then clears it:
+
+```php
+$flagged = $payments->search(new PaymentQuery(flagged: true));       // the admin's queue
+$review->resolveFlag($reference, 'MarzPay confirmed 4,900 received'); // PaymentReviewContract
+```
+
+`PAYMENT_COLLECTION_MISMATCH=hold` brings back the strict behaviour for an **amount**
+that can't be accounted for: the collection stays pending. Fee-only problems always
+settle.
+
+**What is never delivered:** a payment MarzPay hasn't confirmed as completed, and a
+confirmation that belongs to a **different** payment. These aren't inconsistencies in
+this payment; they mean it wasn't paid.
+
+### On every payment and event
+
+`PaymentDTO` and `PaymentSettledIntegrationEvent` carry:
+- `network`;
+- `feeMinor`, the fee MarzPay charged, `null` until known;
+- `feePaidBy`, either `customer` or `business`.
+
+`walletAmountMinor` on `PaymentDTO` is the effect on your MarzPay wallet. For a
+collection, it is the amount credited, less a fee the business bore. For a payout or
+transfer, it is the amount debited (amount + fee).
+
+### Quoting a fee before money moves
+
+```php
+$quote = $fees->quote('collection', 5000, 'UG');           // PaymentFeesContract
+$quote->feeMinor;    // 100 — your agreed 2%
+$quote = $fees->quote('payout', 10000, 'RW');              // network not known yet
+$quote->fees;        // [mtn: 260 "RWF 60 + 2%", airtel: 200 "2%"]
+$quote->minFeeMinor; $quote->maxFeeMinor;                   // 200 … 260
+```
+
+A quote is for display only. Settlement never uses it, and the fee actually charged is
+the one recorded on the payment. `available: false` means no fee is published for that
+amount: below the minimum, above the top band, or a product the market doesn't have.
+
+## Production checklist
+
+- **`MARZPAY_WEBHOOK_SECRET`:** set it, so unsigned callbacks are refused.
+- **A `CachePort` in `withPorts`:** this enables the rate limits (status poll 60/min,
+  webhook 600/min per IP) and the phone-lookup allowance. Without one, they don't apply.
+- **Payout limits:** set `PAYMENT_PAYOUT_MAX` and `PAYMENT_PAYOUT_DAILY_MAX` for every
+  currency you pay out in. Once any are set, an unlisted currency is refused.
+- **Permissions:** keep `PAYMENT_PAYOUT_PERMISSION` and `PAYMENT_ADMIN_PERMISSION` set.
+  Empty means anyone your code lets through.
+- **Reconciliation:** schedule `hkm payments:reconcile` (every 2 minutes).
+- **Flags:** watch `flagReason` on `payment.*` events, or the `flagged` search, and alert
+  someone.
+- **Overriding the webhook route in `proj.json`:** keep its
+  `"filters": ["payment.rate_limit:600"]`.
 
 ## What happened to a payment — the activity journal
 
@@ -428,7 +651,7 @@ against MarzPay's servers. Check these in sandbox before going live:
 - whether the webhook signing key includes its `whsec_` prefix (both are accepted);
 - what `callback_url` means for **card** collections: the docs' example passes a
   thank-you page, while this plugin passes its webhook;
-- whether MarzPay retries a callback answered with `429` or `502`. If it doesn't,
+- whether MarzPay retries a callback answered with `502` (provider unreachable). If it doesn't,
   `payments:reconcile` still settles the payment;
 - **phone verification:** how an unregistered number is answered. The driver treats
   these as `failed`:
@@ -444,6 +667,19 @@ against MarzPay's servers. Check these in sandbox before going live:
   - that `GET /bank-transfer/{reference}` takes the `reference` the create response returns;
   - the status words beyond `processing`, `completed` and `failed`;
   - that no reference of ours can be sent;
+- **fees:**
+  - whether `GET /transactions/{uuid}` carries `charge` / `net_amount`. They are
+    documented on callbacks only; without them, case 3 above applies;
+  - the network names, beyond what the documentation shows. MarzPay's webhook and
+    country guides (2026-10-02) name `mtn`, `airtel`, `mpesa`, `vodacom`, `orange`,
+    `zamtel`, `moov` and `free` (Senegal's Free Money), and `card payments` for a card.
+    The schedule uses those names. In a market priced per network, an unknown name means
+    no fee can be inferred, though a fee MarzPay names still settles;
+  - disbursement callbacks: the webhooks page now shows Uganda payouts with
+    `provider_reference: null`, where the older guide promised our reference. The plugin
+    does not rely on it. It finds and confirms a payout by the uuid it stored when
+    sending it, which is tested with the documented shape;
+  - in which of the two documented ways your account bears collection fees;
 - the text of the unique-index errors on MySQL and PostgreSQL. The phone book tells
   "duplicate number" from "second default" by the index name in the message. That is
   tested on SQLite only.

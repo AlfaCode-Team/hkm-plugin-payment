@@ -52,6 +52,26 @@ final readonly class PaymentDTO
         /** When the current status was announced to listeners; null = still in the outbox. */
         public ?string $notifiedAt = null,
         public int $notifyAttempts = 0,
+        // Since 1.2.0 — the provider's fee and the network that carried it.
+        /** mtn, airtel, mpesa, orange, vodacom, … or "card", as the provider reported it. */
+        public ?string $network = null,
+        /** The provider's fee in minor units; null until it is known. */
+        public ?int $feeMinor = null,
+        public ?string $fee = null,
+        /** "customer" (added on top of the amount) | "business" (taken from it; every payout) */
+        public ?string $feePaidBy = null,
+        /**
+         * The effect on the business wallet once the fee is known: what a
+         * collection CREDITS (amount, less a fee the business bore) or what a
+         * payout DEBITS (amount + fee). Null while the fee is unknown.
+         */
+        public ?int $walletAmountMinor = null,
+        /** The administrator who approved or rejected a withdrawal that waited for approval. */
+        public ?string $reviewedBy = null,
+        public ?string $reviewedAt = null,
+        /** Why an admin must check this payment with the provider; null = nothing to check. It settled regardless. */
+        public ?string $flagReason = null,
+        public ?string $flaggedAt = null,
     ) {
     }
 
@@ -89,12 +109,27 @@ final readonly class PaymentDTO
             lastCheckedAt:         $p->lastCheckedAt()?->format(\DateTimeInterface::RFC3339),
             notifiedAt:            $p->notifiedAt()?->format(\DateTimeInterface::RFC3339),
             notifyAttempts:        $p->notifyAttempts(),
+            network:               $p->network(),
+            feeMinor:              $p->fee()?->minor,
+            fee:                   $p->fee()?->toMajor(),
+            feePaidBy:             $p->feePaidBy(),
+            walletAmountMinor:     $p->walletEffect()?->minor,
+            reviewedBy:            $p->reviewedBy(),
+            reviewedAt:            $p->reviewedAt()?->format(\DateTimeInterface::RFC3339),
+            flagReason:            $p->flagReason(),
+            flaggedAt:             $p->flaggedAt()?->format(\DateTimeInterface::RFC3339),
         );
     }
 
     public function isPending(): bool
     {
         return $this->status === 'pending';
+    }
+
+    /** A withdrawal recorded but not sent: an administrator has to approve it. */
+    public function isAwaitingApproval(): bool
+    {
+        return $this->status === 'requested';
     }
 
     public function succeeded(): bool
@@ -137,6 +172,15 @@ final readonly class PaymentDTO
             'last_checked_at'         => $this->lastCheckedAt,
             'notified_at'             => $this->notifiedAt,
             'notify_attempts'         => $this->notifyAttempts,
+            'network'                 => $this->network,
+            'fee'                     => $this->fee,
+            'fee_minor'               => $this->feeMinor,
+            'fee_paid_by'             => $this->feePaidBy,
+            'wallet_amount_minor'     => $this->walletAmountMinor,
+            'reviewed_by'             => $this->reviewedBy,
+            'reviewed_at'             => $this->reviewedAt,
+            'flag_reason'             => $this->flagReason,
+            'flagged_at'              => $this->flaggedAt,
         ];
     }
 

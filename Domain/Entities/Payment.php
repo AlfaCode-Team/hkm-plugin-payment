@@ -75,6 +75,16 @@ final class Payment
         private int $notifyAttempts = 0,
         private ?PaymentStatus $previousStatus = null,
         private readonly ?BankAccount $bankAccount = null,
+        private ?string $network = null,
+        private ?Money $fee = null,
+        private ?string $feePaidBy = null,
+        private ?string $reviewedBy = null,
+        private ?\DateTimeImmutable $reviewedAt = null,
+        private ?string $flagReason = null,
+        private ?\DateTimeImmutable $flaggedAt = null,
+        private ?string $ownerType = null,
+        private ?string $ownerId = null,
+        private ?string $phoneNumberId = null,
     ) {
     }
 
@@ -99,6 +109,7 @@ final class Payment
         array $piiKeys = [],
         bool $exclusive = true,
         ?BankAccount $bankAccount = null,
+        bool $requiresApproval = false,
     ): self {
         if ($amount->isZero()) {
             throw new \DomainException('Amount must be greater than zero.');
@@ -108,6 +119,9 @@ final class Payment
         }
         if ($direction === PaymentDirection::Payout && !$method->canPayOut()) {
             throw new \DomainException('Payouts are sent to mobile money or a bank account.');
+        }
+        if ($requiresApproval && $direction !== PaymentDirection::Payout) {
+            throw new \DomainException('Only money going out can wait for approval.');
         }
         if ($direction === PaymentDirection::Collection && !$method->canCollect()) {
             throw new \DomainException('Collections are taken by mobile money or card.');
@@ -146,7 +160,7 @@ final class Payment
             piiKeys:      array_values(array_unique($piiKeys)),
             initiatedBy:  $initiatedBy,
             createdAt:    $now,
-            status:       PaymentStatus::Pending,
+            status:       $requiresApproval ? PaymentStatus::Requested : PaymentStatus::Pending,
             exclusiveKey: $key,
             bankAccount:  $method->needsBankAccount() ? $bankAccount : null,
         );
@@ -190,14 +204,139 @@ final class Payment
         int $notifyAttempts,
         ?PaymentStatus $previousStatus,
         ?BankAccount $bankAccount = null,
+        ?string $network = null,
+        ?Money $fee = null,
+        ?string $feePaidBy = null,
+        ?string $reviewedBy = null,
+        ?\DateTimeImmutable $reviewedAt = null,
+        ?string $flagReason = null,
+        ?\DateTimeImmutable $flaggedAt = null,
+        ?string $ownerType = null,
+        ?string $ownerId = null,
+        ?string $phoneNumberId = null,
     ): self {
         return new self(
             $reference, $direction, $method, $provider, $market, $amount, $phone, $description,
             $subjectType, $subjectId, $metadata, $piiKeys, $initiatedBy, $createdAt, $status, $exclusiveKey,
             $providerUuid, $providerReference, $providerTransactionId, $redirectUrl, $failureCode,
             $failureMessage, $settledAt, $lastCheckedAt, $notifiedAt, $notifyAttempts, $previousStatus,
-            $bankAccount,
+            $bankAccount, $network, $fee, $feePaidBy, $reviewedBy, $reviewedAt,
+            $flagReason, $flaggedAt, $ownerType, $ownerId, $phoneNumberId,
         );
+    }
+
+    /**
+     * Hold a payout that has not been recorded or sent yet until an admin
+     * approves it.
+     *
+     * @throws \DomainException for anything but a fresh payout
+     */
+    public function awaitApproval(): void
+    {
+        if ($this->direction !== PaymentDirection::Payout || $this->status !== PaymentStatus::Pending || $this->providerUuid !== null) {
+            throw new \DomainException('Only a payout that has not been sent can wait for approval.');
+        }
+        $this->status = PaymentStatus::Requested;
+    }
+
+    /**
+     * An admin approved a withdrawal that was waiting: it becomes pending and
+     * is sent to the provider next. Not an outcome — nothing is announced for
+     * it; the payout's own outcome is, later.
+     *
+     * @throws \DomainException unless it is waiting for approval
+     */
+    public function approve(string $reviewer, \DateTimeImmutable $at): void
+    {
+        if ($this->status !== PaymentStatus::Requested) {
+            throw new \DomainException("Payment [{$this->reference}] is {$this->status->value}; only a requested withdrawal can be approved.");
+        }
+
+        $this->previousStatus = $this->status;
+        $this->status         = PaymentStatus::Pending;
+        $this->reviewedBy     = mb_substr($reviewer, 0, 64);
+        $this->reviewedAt     = $at;
+    }
+
+    /**
+     * Something about this payment does not add up — an amount or fee that is
+     * not what was agreed — and a person must check it with the provider. A
+     * flag never blocks anything: the payment still settles (the customer gets
+     * what they paid for); the flag is what puts it in front of an admin.
+     * Several problems accumulate in one reason.
+     */
+    public function flag(string $reason, \DateTimeImmutable $at): void
+    {
+        $reason = trim($reason);
+        if ($reason === '') {
+            return;
+        }
+        $combined = $this->flagReason === null || str_contains($this->flagReason, $reason)
+            ? ($this->flagReason ?? $reason)
+            : $this->flagReason . ' | ' . $reason;
+
+        $this->flagReason = mb_substr($combined, 0, 255);
+        $this->flaggedAt ??= $at;
+    }
+
+    /** An admin checked it with the provider. The history keeps who and why. */
+    public function clearFlag(): void
+    {
+        $this->flagReason = null;
+        $this->flaggedAt  = null;
+    }
+
+    /**
+     * Who a withdrawal is for — the owner of the saved number it pays — so an
+     * approval can re-check the number and the owner can cancel the request.
+     */
+    public function forOwner(string $ownerType, string $ownerId, ?string $phoneNumberId): void
+    {
+        $this->ownerType     = mb_substr($ownerType, 0, 60);
+        $this->ownerId       = mb_substr($ownerId, 0, 64);
+        $this->phoneNumberId = $phoneNumberId;
+    }
+
+    public function belongsTo(string $ownerType, string $ownerId): bool
+    {
+        return $this->ownerType !== null && $this->ownerId !== null
+            && hash_equals($this->ownerType, trim($ownerType)) && hash_equals($this->ownerId, trim($ownerId));
+    }
+
+    /** Who decided on a withdrawal that waited for approval (with settle(Rejected) for a refusal). */
+    public function reviewed(string $reviewer, \DateTimeImmutable $at): void
+    {
+        $this->reviewedBy = mb_substr($reviewer, 0, 64);
+        $this->reviewedAt = $at;
+    }
+
+    /** Who bore the provider's fee: added on top for the customer, or taken from the business. */
+    public const FEE_PAID_BY_CUSTOMER = 'customer';
+    public const FEE_PAID_BY_BUSINESS = 'business';
+
+    /** The mobile-money network the provider says carried it (mtn, airtel, mpesa, …) or "card". */
+    public function observedNetwork(?string $network): void
+    {
+        $this->network = $network !== null && $network !== '' ? mb_substr($network, 0, 30) : $this->network;
+    }
+
+    /**
+     * Record the provider's fee and who bore it. A collection's fee is either
+     * added on top for the customer (the provider reports the amount asked plus
+     * its charge) or taken from the business (the provider reports exactly the
+     * amount asked and names its charge); a payout's is always the business's.
+     */
+    public function recordFee(Money $fee, string $paidBy): void
+    {
+        if ($fee->currency !== $this->amount->currency) {
+            throw new \DomainException("A fee in [{$fee->currency}] cannot be recorded on a [{$this->amount->currency}] payment.");
+        }
+        if (!\in_array($paidBy, [self::FEE_PAID_BY_CUSTOMER, self::FEE_PAID_BY_BUSINESS], true)) {
+            throw new \DomainException("Unknown fee payer [{$paidBy}].");
+        }
+
+        $this->fee       = $fee;
+        $this->feePaidBy = $paidBy;
     }
 
     /**
@@ -319,6 +458,40 @@ final class Payment
     public function amount(): Money { return $this->amount; }
     public function phone(): ?PhoneNumber { return $this->phone; }
     public function bankAccount(): ?BankAccount { return $this->bankAccount; }
+    public function network(): ?string { return $this->network; }
+    /** The admin (Identity userId) who approved or rejected a withdrawal that waited for approval. */
+    public function reviewedBy(): ?string { return $this->reviewedBy; }
+    public function reviewedAt(): ?\DateTimeImmutable { return $this->reviewedAt; }
+    /** Why an admin must check this payment with the provider; null = nothing to check. */
+    public function flagReason(): ?string { return $this->flagReason; }
+    public function flaggedAt(): ?\DateTimeImmutable { return $this->flaggedAt; }
+    public function ownerType(): ?string { return $this->ownerType; }
+    public function ownerId(): ?string { return $this->ownerId; }
+    /** The saved phone number a withdrawal pays, when it came from withdraw(). */
+    public function phoneNumberId(): ?string { return $this->phoneNumberId; }
+    /** The provider's fee on this movement, when known. */
+    public function fee(): ?Money { return $this->fee; }
+    /** 'customer' | 'business' | null (fee unknown). */
+    public function feePaidBy(): ?string { return $this->feePaidBy; }
+
+    /**
+     * What this movement does to the business wallet, when the fee is known:
+     * a collection credits the amount minus a fee the business bore; a payout
+     * debits the amount plus the fee. Null while the fee is unknown.
+     */
+    public function walletEffect(): ?Money
+    {
+        if ($this->fee === null) {
+            return null;
+        }
+        if ($this->direction === PaymentDirection::Payout) {
+            return Money::ofMinor($this->amount->minor + $this->fee->minor, $this->amount->currency);
+        }
+
+        return $this->feePaidBy === self::FEE_PAID_BY_BUSINESS
+            ? Money::ofMinor(max(0, $this->amount->minor - $this->fee->minor), $this->amount->currency)
+            : $this->amount;
+    }
     public function description(): ?string { return $this->description; }
     public function subjectType(): ?string { return $this->subjectType; }
     public function subjectId(): ?string { return $this->subjectId; }

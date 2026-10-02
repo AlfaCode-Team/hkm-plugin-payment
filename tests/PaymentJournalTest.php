@@ -325,7 +325,7 @@ final class PaymentJournalTest extends TestCase
         $counts = $this->admin()->statusCounts();
         self::assertSame(1, $counts['pending']);
         self::assertSame(0, $counts['succeeded']);
-        self::assertSame(['pending', 'succeeded', 'failed', 'cancelled', 'expired', 'reversed'], array_keys($counts));
+        self::assertSame(['pending', 'succeeded', 'failed', 'cancelled', 'expired', 'reversed', 'requested', 'rejected'], array_keys($counts));
         self::assertSame(0, $this->admin()->statusCounts('payout')['pending']);
     }
 

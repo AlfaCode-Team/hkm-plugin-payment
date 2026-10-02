@@ -15,10 +15,14 @@ use AlfacodeTeam\PhpServicePlatform\Kernel\Exceptions\ValidationException;
 use AlfacodeTeam\PhpServicePlatform\Kernel\Ports\ClockPort;
 use AlfacodeTeam\PhpServicePlatform\Kernel\Ports\LoggerPort;
 use AlfacodeTeam\PhpServicePlatform\Kernel\Security\Identity;
+use Plugins\Payment\API\Contracts\PaymentFeesContract;
+use Plugins\Payment\API\Contracts\PaymentReviewContract;
 use Plugins\Payment\API\Contracts\PaymentServiceContract;
+use Plugins\Payment\API\Contracts\WithdrawalApprovalContract;
 use Plugins\Payment\API\DTOs\BalanceDTO;
 use Plugins\Payment\API\DTOs\BankTransferDTO;
 use Plugins\Payment\API\DTOs\CollectPaymentDTO;
+use Plugins\Payment\API\DTOs\FeeQuoteDTO;
 use Plugins\Payment\API\DTOs\PaymentDTO;
 use Plugins\Payment\API\DTOs\PaymentPage;
 use Plugins\Payment\API\DTOs\PaymentQuery;
@@ -35,7 +39,10 @@ use Plugins\Payment\Application\Ports\PaymentJournal;
 use Plugins\Payment\Application\Ports\PaymentGateway;
 use Plugins\Payment\Application\Ports\PaymentStore;
 use Plugins\Payment\Application\Ports\PhoneNumberStore;
+use Plugins\Payment\Application\Ports\PricedGateway;
+use Plugins\Payment\Application\Gateway\GatewayResult;
 use Plugins\Payment\Domain\Entities\Payment;
+use Plugins\Payment\Domain\Fees\FeeSchedule;
 use Plugins\Payment\Domain\ValueObjects\BankAccount;
 use Plugins\Payment\Domain\ValueObjects\Market;
 use Plugins\Payment\Domain\ValueObjects\Money;
@@ -74,8 +81,21 @@ use Plugins\Payment\Support\Messages;
  * and never stops the payment itself. `payments` is the truth; the journal is
  * how a person reads what happened to it.
  */
-final class PaymentService implements PaymentServiceContract
+final class PaymentService implements PaymentServiceContract, PaymentFeesContract, WithdrawalApprovalContract, PaymentReviewContract
 {
+    /** PAYMENT_WITHDRAW_APPROVAL: a withdrawal is sent at once ("self") or waits for an admin ("admin"). */
+    public const WITHDRAW_SELF  = 'self';
+    public const WITHDRAW_ADMIN = 'admin';
+
+    /**
+     * PAYMENT_COLLECTION_MISMATCH — when the provider confirms a collection but
+     * its amount does not add up: settle it and flag it for an admin
+     * ("deliver", the default: the customer paid and gets what they paid for),
+     * or keep it pending ("hold").
+     */
+    public const MISMATCH_DELIVER = 'deliver';
+    public const MISMATCH_HOLD    = 'hold';
+
     private const MAX_METADATA = 10;
 
     /** Event types that suggest a SETTLED payment changed at the provider. */
@@ -111,7 +131,19 @@ final class PaymentService implements PaymentServiceContract
         private readonly ?PhoneNumberStore $phones = null,
         private readonly bool $withdrawRequiresVerified = true,
         private readonly ?PaymentJournal $journal = null,
+        private readonly string $withdrawApproval = self::WITHDRAW_SELF,
+        private readonly string $approverPermission = 'payment:approve',
+        private readonly string $collectionMismatch = self::MISMATCH_DELIVER,
+        private readonly array $payoutMinMinor = [],
+        private readonly array $approvalAboveMinor = [],
+        private readonly int $verificationMaxAgeDays = 0,
     ) {
+        if (!\in_array($collectionMismatch, [self::MISMATCH_DELIVER, self::MISMATCH_HOLD], true)) {
+            throw new \InvalidArgumentException("PAYMENT_COLLECTION_MISMATCH must be 'deliver' or 'hold', got [{$collectionMismatch}].");
+        }
+        if (!\in_array($withdrawApproval, [self::WITHDRAW_SELF, self::WITHDRAW_ADMIN], true)) {
+            throw new \InvalidArgumentException("PAYMENT_WITHDRAW_APPROVAL must be 'self' or 'admin', got [{$withdrawApproval}].");
+        }
     }
 
     // ── Money in / money out ──────────────────────────────────────────────────
@@ -140,20 +172,29 @@ final class PaymentService implements PaymentServiceContract
         );
         $this->enforcePayoutLimits($payment->amount());
 
-        return $this->send($payment, $gateway, $dto->callbackBaseUrl);
+        return $this->sendOrRequest($payment, $gateway, $dto->callbackBaseUrl);
     }
 
     public function withdraw(WithdrawDTO $dto): PaymentDTO
     {
-        $this->authorize($this->payoutPermission);
+        // Self-service: the money is sent now, so the caller needs the payout
+        // permission. Admin approval: it is a REQUEST until an admin approves
+        // it — the approver needs the permission; the requester must at least
+        // be someone, so every request has a person behind it.
+        if ($this->withdrawApproval === self::WITHDRAW_SELF) {
+            $this->authorize($this->payoutPermission);
+        } elseif ($this->identity->isGuest()) {
+            throw new SecurityException(
+                Messages::get('requester_required', 'Sign in to request a withdrawal.'),
+                layer: 'payment.forbidden',
+                code:  401,
+            );
+        }
 
         $phones = $this->phones ?? throw new \LogicException('withdraw() needs a PhoneNumberStore.');
         $saved  = $phones->find($dto->phoneNumberId, trim($dto->ownerType), trim($dto->ownerId))
             ?? throw PaymentException::phoneNotFound($dto->phoneNumberId);
-
-        if (!$saved->canReceiveWithdrawal($this->withdrawRequiresVerified)) {
-            throw PaymentException::phoneNotVerified($saved->id(), $saved->verification()->value);
-        }
+        $this->checkDestination($saved, $dto->expectedName);
 
         $gateway = $this->gateways->get($dto->provider);
         $payment = $this->initiate(
@@ -161,9 +202,10 @@ final class PaymentService implements PaymentServiceContract
             $dto->currency, $saved->phone()->value, $dto->description, $dto->subjectType, $dto->subjectId, $dto->metadata,
             $dto->piiMetadataKeys, $dto->exclusive,
         );
+        $payment->forOwner($saved->ownerType(), $saved->ownerId(), $saved->id());
         $this->enforcePayoutLimits($payment->amount());
 
-        return $this->send($payment, $gateway, $dto->callbackBaseUrl);
+        return $this->sendOrRequest($payment, $gateway, $dto->callbackBaseUrl);
     }
 
     public function transfer(BankTransferDTO $dto): PaymentDTO
@@ -186,7 +228,202 @@ final class PaymentService implements PaymentServiceContract
         }
         $this->enforcePayoutLimits($payment->amount());
 
-        return $this->send($payment, $gateway, null);
+        return $this->sendOrRequest($payment, $gateway, null);
+    }
+
+    // ── Money out that waits for an admin (PAYMENT_WITHDRAW_APPROVAL=admin) ───
+
+    public function approveWithdrawal(string $reference, ?string $callbackBaseUrl = null): PaymentDTO
+    {
+        $payment  = $this->awaitingDecision($reference);
+        $reviewer = $this->identity->userId;
+
+        // Days may have passed: the number may have been removed or failed a
+        // re-check, and today's limits apply to money sent today.
+        $this->recheckBeforeSending($payment);
+
+        $payment->approve($reviewer, $this->clock->now());
+        if (!$this->write($payment, fn(): bool => $this->store->update($payment, PaymentStatus::Requested))) {
+            // Approved, rejected or cancelled by someone else a moment ago.
+            throw PaymentException::notAwaitingApproval($reference, (string) $this->reload($payment)->status()->value);
+        }
+        $this->journalFor($payment, 'withdrawal.approved', 'admin', [
+            'status_from' => PaymentStatus::Requested->value,
+            'status_to'   => PaymentStatus::Pending->value,
+            'detail'      => "Approved by {$reviewer}; sending it to the provider.",
+        ]);
+
+        return $this->dispatch($payment, $this->gateways->get($payment->provider()), $callbackBaseUrl);
+    }
+
+    public function rejectWithdrawal(string $reference, ?string $reason = null): PaymentDTO
+    {
+        $payment  = $this->awaitingDecision($reference);
+        $reviewer = $this->identity->userId;
+        $reason   = $reason !== null && trim($reason) !== '' ? mb_substr(trim($reason), 0, 255) : 'Rejected by an administrator.';
+
+        $payment->reviewed($reviewer, $this->clock->now());
+        if (!$this->transition($payment, PaymentStatus::Rejected, null, 'payment.withdrawal_rejected', $reason, 'admin')) {
+            throw PaymentException::notAwaitingApproval($reference, (string) $this->reload($payment)->status()->value);
+        }
+        $this->journalFor($payment, 'withdrawal.rejected', 'admin', ['detail' => "Rejected by {$reviewer}: {$reason}"]);
+
+        return PaymentDTO::from($this->reload($payment));
+    }
+
+    public function cancelWithdrawal(string $reference, string $ownerType, string $ownerId): PaymentDTO
+    {
+        $payment = $this->load($reference);
+        // Another owner's request is "not found" — an id copied from one
+        // account must not even confirm that it exists.
+        if ($payment === null || !$payment->belongsTo($ownerType, $ownerId)) {
+            throw PaymentException::notFound($reference);
+        }
+        if ($payment->status() !== PaymentStatus::Requested) {
+            throw PaymentException::notAwaitingApproval($reference, $payment->status()->value);
+        }
+        if (!$this->transition($payment, PaymentStatus::Cancelled, null, 'payment.withdrawal_cancelled', 'Cancelled by the owner before approval.', 'owner')) {
+            throw PaymentException::notAwaitingApproval($reference, (string) $this->reload($payment)->status()->value);
+        }
+
+        return PaymentDTO::from($this->reload($payment));
+    }
+
+    // ── Payments an admin must check with the provider ────────────────────────
+
+    public function resolveFlag(string $reference, string $note): PaymentDTO
+    {
+        return $this->resolveFlagOnce($reference, $note, retry: true);
+    }
+
+    private function resolveFlagOnce(string $reference, string $note, bool $retry): PaymentDTO
+    {
+        $this->authorize($this->adminPermission);
+        if ($this->identity->isGuest()) {
+            throw new SecurityException(
+                Messages::get('approver_required', 'A signed-in administrator must approve withdrawals.'),
+                layer: 'payment.forbidden',
+                code:  403,
+            );
+        }
+
+        $payment = $this->load($reference) ?? throw PaymentException::notFound($reference);
+        $reason  = $payment->flagReason();
+        if ($reason === null) {
+            return PaymentDTO::from($payment);
+        }
+
+        $note = trim($note) !== '' ? mb_substr(trim($note), 0, 200) : 'checked with the provider';
+        $payment->clearFlag();
+        if (!$this->write($payment, fn(): bool => $this->store->update($payment, $payment->status()))) {
+            // The status moved meanwhile; resolve once more against what is stored now.
+            if ($retry) {
+                return $this->resolveFlagOnce($reference, $note, retry: false);
+            }
+            throw PaymentException::notFound($reference);
+        }
+        $this->journalFor($payment, 'flag.resolved', 'admin', [
+            'detail' => "Resolved by {$this->identity->userId}: {$note} (was: {$reason})",
+        ]);
+
+        return PaymentDTO::from($this->reload($payment));
+    }
+
+    /** Record and send now, or record as a request an admin approves. */
+    private function sendOrRequest(Payment $payment, PaymentGateway $gateway, ?string $callbackBaseUrl): PaymentDTO
+    {
+        if (!$this->needsApproval($payment->amount())) {
+            return $this->send($payment, $gateway, $callbackBaseUrl);
+        }
+
+        $payment->awaitApproval();
+        $this->record($payment);
+        // payout.requested — so the application can tell its admins.
+        $this->announce($payment);
+
+        return PaymentDTO::from($this->reload($payment));
+    }
+
+    /**
+     * Admin mode: every payout waits, except those at or below
+     * PAYMENT_APPROVAL_ABOVE for their currency. A currency not listed there
+     * always waits.
+     */
+    private function needsApproval(Money $amount): bool
+    {
+        if ($this->withdrawApproval !== self::WITHDRAW_ADMIN) {
+            return false;
+        }
+        $threshold = $this->approvalAboveMinor[$amount->currency] ?? null;
+
+        return $threshold === null || $amount->minor > $threshold;
+    }
+
+    /**
+     * May money go to this saved number now? It must not have FAILED a
+     * lookup, must be verified when that is required, must not have been
+     * verified longer ago than PAYMENT_PHONE_VERIFICATION_MAX_AGE_DAYS, and —
+     * when the caller says whose it should be — must be registered to that name.
+     */
+    private function checkDestination(\Plugins\Payment\Domain\Entities\SavedPhoneNumber $saved, ?string $expectedName): void
+    {
+        if (!$saved->canReceiveWithdrawal($this->withdrawRequiresVerified)) {
+            throw PaymentException::phoneNotVerified($saved->id(), $saved->verification()->value);
+        }
+        if ($this->verificationMaxAgeDays > 0 && $saved->verification() === \Plugins\Payment\Domain\ValueObjects\PhoneVerificationStatus::Verified) {
+            $limit = $this->clock->now()->modify(sprintf('-%d days', $this->verificationMaxAgeDays));
+            if ($saved->verifiedAt() === null || $saved->verifiedAt() < $limit) {
+                throw PaymentException::phoneNotVerified($saved->id(), 'stale');
+            }
+        }
+        if ($expectedName !== null && trim($expectedName) !== '' && $saved->registeredName() !== null
+            && !\Plugins\Payment\Domain\Rules\NameMatch::check($saved->registeredName(), $expectedName)) {
+            throw PaymentException::phoneNameMismatch($saved->id());
+        }
+    }
+
+    /** Before an approved request is sent: is everything that was checked still true? */
+    private function recheckBeforeSending(Payment $payment): void
+    {
+        if ($payment->phoneNumberId() !== null && $payment->ownerType() !== null && $payment->ownerId() !== null) {
+            $saved = $this->phones?->find($payment->phoneNumberId(), $payment->ownerType(), $payment->ownerId());
+            if ($saved === null || $saved->phone()->value !== $payment->phone()?->value) {
+                throw PaymentException::phoneNotFound($payment->phoneNumberId());
+            }
+            $this->checkDestination($saved, null);
+        }
+        $this->enforcePayoutLimits($payment->amount(), $payment);
+    }
+
+    /**
+     * The request an approver may decide on — after checking the approver.
+     * Nobody decides on their own request: that is the point of approval.
+     */
+    private function awaitingDecision(string $reference): Payment
+    {
+        $this->authorize($this->approverPermission);
+        if ($this->identity->isGuest()) {
+            throw new SecurityException(
+                Messages::get('approver_required', 'A signed-in administrator must approve withdrawals.'),
+                layer: 'payment.forbidden',
+                code:  403,
+            );
+        }
+
+        $payment = $this->load($reference) ?? throw PaymentException::notFound($reference);
+        if ($payment->status() !== PaymentStatus::Requested) {
+            throw PaymentException::notAwaitingApproval($reference, $payment->status()->value);
+        }
+        if ($payment->initiatedBy() !== null && hash_equals($payment->initiatedBy(), $this->identity->userId)) {
+            throw new SecurityException(
+                Messages::get('own_withdrawal', 'You cannot approve or reject your own withdrawal.'),
+                layer:   'payment.forbidden',
+                context: ['reference' => $reference],
+                code:    403,
+            );
+        }
+
+        return $payment;
     }
 
     // ── Reading ───────────────────────────────────────────────────────────────
@@ -278,13 +515,15 @@ final class PaymentService implements PaymentServiceContract
     public function handleNotification(string $provider, string $rawBody, \Closure $header): void
     {
         $gateway = $this->gateways->get($provider);
-        $entry   = ['provider' => $gateway->name(), 'kind' => 'webhook.received', 'payload' => $rawBody];
+        // Kept for an operator, but never verbatim: phone numbers, names, bank
+        // accounts and PII-flagged metadata are masked, and the size is capped.
+        $entry   = ['provider' => $gateway->name(), 'kind' => 'webhook.received', 'payload' => self::redact($rawBody, 4096)];
 
         try {
             $notification = $gateway->parseNotification($rawBody, $header);
         } catch (InvalidSignatureException $e) {
             // Kept, but only the start of the body: it is unauthenticated input.
-            $this->journal(['outcome' => 'invalid_signature', 'payload' => mb_strcut($rawBody, 0, 2048, 'UTF-8')] + $entry);
+            $this->journal(['outcome' => 'invalid_signature', 'payload' => self::redact($rawBody, 1024)] + $entry);
             throw new SecurityException(
                 Messages::get('invalid_signature', 'Invalid webhook signature.'),
                 layer:    'payment.webhook.invalid_signature',
@@ -294,7 +533,7 @@ final class PaymentService implements PaymentServiceContract
             );
         } catch (GatewayException $e) {
             // Not a callback at all. Acknowledge it so nothing retries it forever.
-            $this->journal(['outcome' => 'unreadable', 'detail' => $e->getMessage()] + $entry);
+            $this->journal(['outcome' => 'unreadable', 'detail' => $e->getMessage(), 'payload' => self::redact($rawBody, 1024)] + $entry);
             $this->logger?->notice('Ignored an unreadable payment callback', ['provider' => $gateway->name(), 'error' => $e->getMessage()]);
 
             return;
@@ -344,9 +583,16 @@ final class PaymentService implements PaymentServiceContract
         // Every callback costs a provider API call. Anyone who knows a reference
         // (the payer does) could otherwise turn this endpoint into a way to burn
         // the business's rate limit.
+        //
+        // ACKNOWLEDGED, not refused: anyone can send a fake callback for a
+        // reference they know, and a 429 here would turn MarzPay's genuine
+        // callback, arriving a moment later, into a refusal too. The payment
+        // was checked seconds ago; the checkout's status poll and
+        // `payments:reconcile` check it again shortly.
         if ($payment->checkedWithin($this->clock->now(), $this->webhookMinInterval)) {
-            $this->resolveJournal($entryId, 'throttled', $reference);
-            throw PaymentException::throttled($reference);
+            $this->resolveJournal($entryId, 'deferred', $reference, 'Checked moments ago; the next status poll or reconciliation checks it again.');
+
+            return;
         }
 
         try {
@@ -429,6 +675,83 @@ final class PaymentService implements PaymentServiceContract
         return $this->announce($payment);
     }
 
+    public function quote(
+        string $direction,
+        string|int|float $amount,
+        ?string $country = null,
+        ?string $currency = null,
+        ?string $network = null,
+        ?string $provider = null,
+    ): FeeQuoteDTO {
+        $direction = strtolower(trim($direction));
+        $errors    = [];
+        if (!\in_array($direction, [FeeSchedule::COLLECTION, FeeSchedule::PAYOUT, FeeSchedule::BANK_TRANSFER, FeeSchedule::BILL], true)) {
+            $errors['direction'] = Messages::get('validation.fee_direction', 'Direction must be collection, payout, bank_transfer or bill.');
+        }
+
+        $market = null;
+        $money  = null;
+        try {
+            $market = Market::of($country ?? $this->defaultCountry, $currency);
+        } catch (\DomainException $e) {
+            $errors['country'] = Messages::get('validation.market', $e->getMessage());
+        }
+        if ($market !== null) {
+            try {
+                $money = Money::ofMajor($amount, $market->currency);
+            } catch (\DomainException $e) {
+                $errors['amount'] = Messages::get('validation.amount', $e->getMessage());
+            }
+        }
+        if ($errors !== [] || $market === null || $money === null) {
+            throw new ValidationException($errors);
+        }
+
+        $gateway  = $this->gateways->get($provider);
+        $schedule = $gateway instanceof PricedGateway ? $gateway->fees() : new FeeSchedule([]);
+        $network  = $network !== null && trim($network) !== '' ? FeeSchedule::network($network) : null;
+
+        $candidates = $network !== null
+            ? array_filter([$network => $schedule->rule($direction, $market->country, $network)])
+            : $schedule->rulesFor($direction, $market->country);
+
+        $lines = [];
+        foreach ($candidates as $name => $found) {
+            $fee = $found['rule']->feeFor($money);
+            if ($fee === null) {
+                continue;
+            }
+            $lines[] = [
+                'network'   => (string) $name,
+                'fee_minor' => $fee->minor,
+                'fee'       => $fee->toMajor(),
+                'rate'      => $found['rule']->describe($money),
+                'source'    => $found['source'],
+            ];
+        }
+
+        $amounts = array_column($lines, 'fee_minor');
+        $min     = $amounts !== [] ? min($amounts) : null;
+        $max     = $amounts !== [] ? max($amounts) : null;
+        $single  = $min !== null && $min === $max ? $min : null;
+
+        return new FeeQuoteDTO(
+            direction:   $direction,
+            country:     $market->country,
+            currency:    $market->currency,
+            amountMinor: $money->minor,
+            amount:      $money->toMajor(),
+            network:     $network,
+            fees:        $lines,
+            feeMinor:    $single,
+            fee:         $single !== null ? Money::ofMinor($single, $market->currency)->toMajor() : null,
+            minFeeMinor: $min,
+            maxFeeMinor: $max,
+            available:   $lines !== [],
+            publishedOn: $schedule->publishedOn,
+        );
+    }
+
     public function balance(?string $country = null, ?string $currency = null, ?string $provider = null): BalanceDTO
     {
         $this->authorize($this->adminPermission);
@@ -457,15 +780,22 @@ final class PaymentService implements PaymentServiceContract
      */
     private function send(Payment $payment, PaymentGateway $gateway, ?string $callbackBaseUrl): PaymentDTO
     {
+        $this->record($payment);
+
+        return $this->dispatch($payment, $gateway, $callbackBaseUrl);
+    }
+
+    /** Write the new payment — before anything is asked of the provider. */
+    private function record(Payment $payment): void
+    {
         try {
             $this->write($payment, fn(): bool => $this->insert($payment));
         } catch (SubjectConflictException) {
             throw $this->subjectConflict($payment);
         }
 
-        $reference = (string) $payment->reference();
-        $this->journalFor($payment, 'payment.created', null, [
-            'status_to' => PaymentStatus::Pending->value,
+        $this->journalFor($payment, $payment->status() === PaymentStatus::Requested ? 'withdrawal.requested' : 'payment.created', null, [
+            'status_to' => $payment->status()->value,
             'detail'    => sprintf(
                 '%s %s %s %s%s',
                 $payment->direction()->value,
@@ -473,8 +803,14 @@ final class PaymentService implements PaymentServiceContract
                 $payment->amount()->toMajor(),
                 $payment->amount()->currency,
                 $payment->subjectType() !== null ? " for {$payment->subjectType()}:{$payment->subjectId()}" : '',
-            ),
+            ) . ($payment->status() === PaymentStatus::Requested ? ' — waiting for an administrator to approve it' : ''),
         ]);
+    }
+
+    /** Ask the provider to perform a recorded, pending payment. */
+    private function dispatch(Payment $payment, PaymentGateway $gateway, ?string $callbackBaseUrl): PaymentDTO
+    {
+        $reference = (string) $payment->reference();
         $callback  = $this->callbackUrl($gateway->name(), $callbackBaseUrl);
 
         try {
@@ -518,11 +854,21 @@ final class PaymentService implements PaymentServiceContract
         }
 
         $payment->acceptedByProvider($result->providerUuid, $result->providerReference, $result->redirectUrl);
+        $this->observeFee($payment, $result);
         $this->journalFor($payment, 'provider.accepted', 'create', [
             'provider_uuid' => $result->providerUuid,
             'detail'        => trim('Provider status: ' . $result->status->value
-                . ($result->providerReference !== null ? " · provider reference {$result->providerReference}" : '')),
+                . ($result->providerReference !== null ? " · provider reference {$result->providerReference}" : '')
+                . ($payment->fee() !== null ? " · fee {$payment->fee()->toMajor()} {$payment->fee()->currency}" : '')),
         ]);
+        if ($payment->direction() === PaymentDirection::Payout) {
+            // The fee is named when a payout is accepted; check it against the
+            // schedule once, here, not on every later status check.
+            $unexpected = $this->checkAgreedFee($payment, $result, $gateway, 'create');
+            if ($unexpected !== null) {
+                $this->flagFor($payment, $unexpected, 'create');
+            }
+        }
 
         if ($result->status === PaymentStatus::Failed || $result->status === PaymentStatus::Cancelled) {
             $this->transition($payment, $result->status, $result->providerTransactionId, $result->failureCode, $result->failureMessage, 'create');
@@ -593,6 +939,7 @@ final class PaymentService implements PaymentServiceContract
         }
 
         $payment->acceptedByProvider($result->providerUuid ?? $uuid, $result->providerReference, null);
+        $this->observeFee($payment, $result);
         $current = $payment->status();
         $target  = $result->status;
 
@@ -627,52 +974,302 @@ final class PaymentService implements PaymentServiceContract
             return 'unchanged';
         }
 
-        // Collections only: this is what stops "asked for 50,000, paid 500" from
-        // fulfilling the order. A payout's reported amount may or may not include
-        // the provider's charge, and it is money WE sent.
-        // A provider may report the GROSS it collected — what was asked plus its
-        // own charge (MarzPay: 3-4%). The gateway names that charge; the amount
-        // asked must then be exactly what is left once it is taken off.
-        $netOfFee = $result->amount !== null && $result->providerFee !== null
-            && $result->providerFee->currency === $result->amount->currency
-            && $result->amount->minor - $result->providerFee->minor === $payment->amount()->minor
-            && $result->amount->currency === $payment->amount()->currency;
+        // Collections: does what the provider confirmed add up to what was asked?
+        // The provider's own API has said this payment is COMPLETED, so the
+        // customer has paid. Anything that does not add up — the amount, the
+        // fee — FLAGS the payment for an admin to check with the provider, and
+        // the payment still settles: the customer gets what they paid for
+        // (PAYMENT_COLLECTION_MISMATCH=hold restores the old refusal for an
+        // amount that cannot be accounted for).
+        if ($target === PaymentStatus::Succeeded && $payment->direction() === PaymentDirection::Collection) {
+            $problems    = [];
+            $amountIssue = false;
 
-        if ($target === PaymentStatus::Succeeded
-            && $payment->direction() === PaymentDirection::Collection
-            && $result->amount !== null
-            && $netOfFee) {
-            $this->journalFor($payment, 'check.fee_included', $via, [
-                'detail' => sprintf(
-                    'Provider reports %s %s: %s asked + %s provider fee.',
-                    $result->amount->toMajor(), $result->amount->currency,
-                    $payment->amount()->toMajor(), $result->providerFee->toMajor(),
-                ),
-            ]);
-        } elseif ($target === PaymentStatus::Succeeded
-            && $payment->direction() === PaymentDirection::Collection
-            && $result->amount !== null
-            && !$result->amount->equals($payment->amount())) {
-            $this->logger?->error('Provider reports a different amount; not settling', [
-                'reference' => (string) $payment->reference(),
-                'expected'  => $payment->amount()->toMajor() . ' ' . $payment->amount()->currency,
-                'reported'  => $result->amount->toMajor() . ' ' . $result->amount->currency,
-            ]);
-            $this->journalFor($payment, 'check.unverifiable', $via, [
-                'detail' => sprintf(
-                    'Provider reports %s %s paid, expected %s %s; not settled.',
-                    $result->amount->toMajor(), $result->amount->currency,
-                    $payment->amount()->toMajor(), $payment->amount()->currency,
-                ),
-            ]);
-            $this->touch($payment);
+            if ($result->amount === null) {
+                $amountIssue = true;
+                $problems[]  = sprintf(
+                    'Provider confirmed the payment of %s %s but its amount could not be checked (%s).',
+                    $payment->amount()->toMajor(), $payment->amount()->currency, $result->amountAnomaly ?? 'no amount',
+                );
+            } else {
+                $verdict = $this->collectedAmount($payment, $result, $gateway);
+                if ($verdict['fee'] === false) {
+                    $amountIssue = true;
+                    $problems[]  = $verdict['detail'];
+                } elseif ($verdict['fee'] !== null) {
+                    $payment->recordFee($verdict['fee'], $verdict['paidBy']);
+                    if ($verdict['paidBy'] === Payment::FEE_PAID_BY_CUSTOMER) {
+                        $this->journalFor($payment, 'check.fee_included', $via, ['detail' => $verdict['detail']]);
+                    }
+                }
+                if ($verdict['flag'] !== null) {
+                    $problems[] = $verdict['flag'];
+                }
+            }
+            if ($result->feeAnomaly !== null) {
+                $problems[] = "Provider fee: {$result->feeAnomaly}.";
+            }
+            $unexpected = $this->checkAgreedFee($payment, $result, $gateway, $via);
+            if ($unexpected !== null) {
+                $problems[] = $unexpected;
+            }
 
-            return 'unverifiable';
+            if ($amountIssue && $this->collectionMismatch === self::MISMATCH_HOLD) {
+                $this->logger?->error('Provider reports an amount that does not add up; held (PAYMENT_COLLECTION_MISMATCH=hold)', [
+                    'reference' => (string) $payment->reference(),
+                    'detail'    => implode(' ', $problems),
+                ]);
+                $this->journalFor($payment, 'check.unverifiable', $via, ['detail' => implode(' ', $problems) . ' Not settled.']);
+                $this->touch($payment);
+
+                return 'unverifiable';
+            }
+
+            foreach ($problems as $problem) {
+                $this->flagFor($payment, $problem, $via);
+            }
         }
 
         $this->transition($payment, $target, $result->providerTransactionId, $result->failureCode, $result->failureMessage, $via);
 
         return 'settled';
+    }
+
+    /** A reported fee above this share of the amount is not believed (MarzPay's highest is 5%). */
+    private const MAX_FEE_BASIS_POINTS = 1_000;
+
+    /**
+     * Does what the provider reports as collected account for exactly what was
+     * asked? Two ways it can, both documented by MarzPay (`amount` = what the
+     * customer paid, `charge` = its fee, `net_amount` = amount − charge):
+     *
+     *  - the reported amount IS the amount asked — the business bore the fee
+     *    (recorded when the provider names it);
+     *  - the reported amount minus the provider's fee is the amount asked — the
+     *    fee was added on top for the customer. The fee is the one the provider
+     *    NAMED, or, when it named none, a surplus that is exactly the agreed fee
+     *    for that country and network.
+     *
+     * Anything else — less than asked, or more than asked by an amount nothing
+     * explains — is not settled.
+     *
+     * @return array{fee: Money|null|false, paidBy: ?string, detail: string} fee false = not accounted for
+     */
+    private function collectedAmount(Payment $payment, GatewayResult $result, PaymentGateway $gateway): array
+    {
+        $asked    = $payment->amount();
+        $reported = $result->amount;
+        $fee      = $result->providerFee;
+        $flag     = null;
+        \assert($reported !== null);
+
+        if ($fee !== null && $fee->currency !== $asked->currency) {
+            $flag = "Provider named a fee in {$fee->currency} on a {$asked->currency} payment; not recorded.";
+            $fee  = null;
+        } elseif ($fee !== null && $result->feeReported && $fee->minor * 10_000 > $asked->minor * self::MAX_FEE_BASIS_POINTS) {
+            $flag = sprintf(
+                'Provider named a fee of %s %s (%s) — above the %d%% any provider charges; not recorded.',
+                $fee->toMajor(), $fee->currency, self::share($fee, $asked), intdiv(self::MAX_FEE_BASIS_POINTS, 100),
+            );
+            $fee = null;
+        }
+
+        if ($reported->equals($asked)) {
+            return [
+                'fee'    => $fee !== null && $result->feeReported && $fee->minor < $asked->minor ? $fee : null,
+                'paidBy' => Payment::FEE_PAID_BY_BUSINESS,
+                'detail' => '',
+                'flag'   => $flag,
+            ];
+        }
+
+        if ($fee !== null && $reported->currency === $asked->currency && $reported->minor - $fee->minor === $asked->minor) {
+            return [
+                'fee'    => $fee,
+                'paidBy' => Payment::FEE_PAID_BY_CUSTOMER,
+                'detail' => sprintf(
+                    'Provider reports %s %s: %s asked + %s provider fee (%s%s).',
+                    $reported->toMajor(), $reported->currency, $asked->toMajor(), $fee->toMajor(),
+                    self::share($fee, $asked), $result->network !== null ? ', ' . $result->network : '',
+                ),
+                'flag'   => $flag,
+            ];
+        }
+
+        $agreed = $this->agreedRule($gateway, $payment, $result->network);
+
+        return [
+            'fee'    => false,
+            'paidBy' => null,
+            'flag'   => $flag,
+            'detail' => sprintf(
+                'Provider reports %s %s paid, expected %s %s%s.',
+                $reported->toMajor(), $reported->currency, $asked->toMajor(), $asked->currency,
+                $reported->currency === $asked->currency && $reported->minor > $asked->minor
+                    ? sprintf(
+                        ' (+%s = %s%s)',
+                        Money::ofMinor($reported->minor - $asked->minor, $asked->currency)->toMajor(),
+                        self::share(Money::ofMinor($reported->minor - $asked->minor, $asked->currency), $asked),
+                        $agreed !== null
+                            ? sprintf('; the %s fee%s is %s', $agreed['source'] === FeeSchedule::SOURCE_ACCOUNT ? 'agreed' : 'published',
+                                $result->network !== null ? ' on ' . $result->network : '', $agreed['rule']->describe($asked))
+                            : '; no fee is known for this network',
+                    )
+                    : ($reported->currency === $asked->currency
+                        ? sprintf(' (%s short)', Money::ofMinor($asked->minor - $reported->minor, $asked->currency)->toMajor())
+                        : ' (another currency)'),
+            ),
+        ];
+    }
+
+    /**
+     * A fee the provider NAMED that is not the agreed one is still settled on
+     * (the amount checks out — the customer or the business paid it), but it is
+     * a billing discrepancy someone must take up with the provider: logged and
+     * journaled as check.fee_unexpected.
+     */
+    private function checkAgreedFee(Payment $payment, GatewayResult $result, PaymentGateway $gateway, ?string $via): ?string
+    {
+        $fee = $payment->fee();
+        // MarzPay documents `charge` as 0 "when there is no fee" — nothing was
+        // charged, so there is nothing to dispute.
+        if ($fee === null || !$result->feeReported || $fee->minor === 0) {
+            return null;
+        }
+
+        $agreed = $this->agreedRule($gateway, $payment, $result->network);
+        if ($agreed === null || $agreed['rule']->accepts($payment->amount(), $fee->minor)) {
+            return null;
+        }
+
+        $expected = $agreed['rule']->feeFor($payment->amount());
+        $detail   = sprintf(
+            'Provider charged %s %s (%s) on %s %s%s; the %s fee is %s (%s %s).',
+            $fee->toMajor(), $fee->currency, self::share($fee, $payment->amount()),
+            $payment->amount()->toMajor(), $payment->amount()->currency,
+            $result->network !== null ? ' via ' . $result->network : '',
+            $agreed['source'] === FeeSchedule::SOURCE_ACCOUNT ? 'agreed' : 'published',
+            $agreed['rule']->describe($payment->amount()),
+            $expected?->toMajor() ?? '?', $payment->amount()->currency,
+        );
+        $this->logger?->warning('Provider fee differs from the agreed fee', [
+            'reference' => (string) $payment->reference(),
+            'detail'    => $detail,
+        ]);
+        $this->journalFor($payment, 'check.fee_unexpected', $via, ['detail' => $detail]);
+
+        return $detail;
+    }
+
+    /**
+     * Put the payment in front of an admin: kept on the payment (flag_reason,
+     * `flagged` in search), on its next announcement (flagReason), in its
+     * history (check.flagged) and in the log.
+     */
+    private function flagFor(Payment $payment, string $problem, ?string $via): void
+    {
+        $payment->flag($problem, $this->clock->now());
+        $this->journalFor($payment, 'check.flagged', $via, ['detail' => $problem . ' Settled; check it with the provider.']);
+        $this->logger?->error('Payment flagged for a check with the provider', [
+            'reference' => (string) $payment->reference(),
+            'detail'    => $problem,
+        ]);
+    }
+
+    /**
+     * The network the provider reports, and a payout's or transfer's fee as the
+     * provider names it (always the business's to bear).
+     */
+    private function observeFee(Payment $payment, GatewayResult $result): void
+    {
+        $payment->observedNetwork($result->network);
+        if ($payment->direction() === PaymentDirection::Payout && $result->providerFee !== null && $result->feeReported
+            && $result->providerFee->currency === $payment->amount()->currency) {
+            $payment->recordFee($result->providerFee, Payment::FEE_PAID_BY_BUSINESS);
+        }
+    }
+
+    /** @return array{rule: \Plugins\Payment\Domain\Fees\FeeRule, source: string}|null */
+    private function agreedRule(PaymentGateway $gateway, Payment $payment, ?string $network): ?array
+    {
+        if (!$gateway instanceof PricedGateway) {
+            return null;
+        }
+
+        return $gateway->fees()->rule(self::feeDirection($payment), $payment->market()->country, $network ?? $payment->network());
+    }
+
+    private static function feeDirection(Payment $payment): string
+    {
+        return match (true) {
+            $payment->direction() === PaymentDirection::Collection => FeeSchedule::COLLECTION,
+            $payment->method() === PaymentMethod::BankTransfer     => FeeSchedule::BANK_TRANSFER,
+            default                                                => FeeSchedule::PAYOUT,
+        };
+    }
+
+    private const REDACT_NAMES  = ['recipient_name', 'first_name', 'last_name', 'full_name', 'customer_name', 'account_name', 'bank_account_name', 'name', 'email', 'registered_name'];
+    private const REDACT_PHONES = ['phone_number', 'phonenumber', 'msisdn', 'phone'];
+    private const REDACT_BANK   = ['bank_account_number', 'account_number'];
+
+    /**
+     * A provider callback as an operator may see it: phone numbers and bank
+     * account numbers masked to their last digits, names and e-mails removed,
+     * metadata the caller flagged isPII removed — then capped at $maxBytes.
+     * A body that is not JSON keeps no long digit run intact either.
+     */
+    private static function redact(string $raw, int $maxBytes): string
+    {
+        $mask = static fn(string $v, int $keep): string
+            => (preg_replace('/\d/', '•', substr($v, 0, max(0, \strlen($v) - $keep))) ?? '') . substr($v, -$keep);
+
+        $json = json_decode($raw, true);
+        if (!\is_array($json)) {
+            $masked = preg_replace_callback('/\+?\d{7,}/', static fn(array $m): string => $mask($m[0], 3), $raw) ?? '';
+
+            return mb_strcut($masked, 0, $maxBytes, 'UTF-8');
+        }
+
+        $walk = static function (mixed $node) use (&$walk, $mask): mixed {
+            if (!\is_array($node)) {
+                return $node;
+            }
+            if (($node['isPII'] ?? false) === true) {
+                foreach ($node as $k => $v) {
+                    $node[$k] = $k === 'isPII' ? true : '[redacted]';
+                }
+
+                return $node;
+            }
+            foreach ($node as $key => $value) {
+                $k = \is_string($key) ? strtolower($key) : '';
+                if (\is_scalar($value) && \in_array($k, self::REDACT_NAMES, true)) {
+                    $node[$key] = '[redacted]';
+                } elseif (\is_scalar($value) && \in_array($k, self::REDACT_PHONES, true)) {
+                    $node[$key] = $mask((string) $value, 3);
+                } elseif (\is_scalar($value) && \in_array($k, self::REDACT_BANK, true)) {
+                    $node[$key] = $mask((string) $value, 4);
+                } else {
+                    $node[$key] = $walk($value);
+                }
+            }
+
+            return $node;
+        };
+
+        $encoded = json_encode($walk($json), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PARTIAL_OUTPUT_ON_ERROR);
+
+        return mb_strcut((string) $encoded, 0, $maxBytes, 'UTF-8');
+    }
+
+    /** 201.88 of 5,047.00 → "4%"; 100.94 → "2%"; 2 decimals at most. */
+    private static function share(Money $part, Money $whole): string
+    {
+        if ($whole->minor === 0) {
+            return '?%';
+        }
+
+        return rtrim(rtrim(number_format($part->minor * 100 / $whole->minor, 2, '.', ''), '0'), '.') . '%';
     }
 
     /**
@@ -770,8 +1367,15 @@ final class PaymentService implements PaymentServiceContract
             providerTransactionId: $payment->providerTransactionId(),
             failureCode:           $payment->failureCode(),
             occurredAt:            ($payment->settledAt() ?? $now)->format(\DateTimeInterface::RFC3339),
-            previousStatus:        ($payment->previousStatus() ?? PaymentStatus::Pending)->value,
+            // "none" for a withdrawal request — it has no earlier status.
+            previousStatus:        $payment->previousStatus()?->value
+                ?? ($payment->status() === PaymentStatus::Requested ? 'none' : PaymentStatus::Pending->value),
             method:                $payment->method()->value,
+            network:               $payment->network(),
+            feeMinor:              $payment->fee()?->minor,
+            feePaidBy:             $payment->feePaidBy(),
+            reviewedBy:            $payment->reviewedBy(),
+            flagReason:            $payment->flagReason(),
         ));
 
         if ($failures === []) {
@@ -803,9 +1407,20 @@ final class PaymentService implements PaymentServiceContract
             }
         }
 
-        // Bookkeeping only: guarded on the status we announced, so it can never
-        // overwrite a newer status another process wrote meanwhile.
-        $this->write($payment, fn(): bool => $this->store->update($payment, $payment->status()));
+        // Bookkeeping only — notified_at and notify_attempts, nothing else, and
+        // only while the status is still the one announced. Writing the whole
+        // row here could revert a fee, a flag or a check time another process
+        // wrote meanwhile.
+        try {
+            $this->store->markNotified($payment, $payment->status());
+        } catch (RepositoryException $e) {
+            // The announcement happened; failing to note it only means it may
+            // be redelivered (listeners are idempotent on eventId).
+            $this->logger?->warning('Could not record a payment announcement', [
+                'reference' => (string) $payment->reference(),
+                'error'     => $e->getMessage(),
+            ]);
+        }
 
         return $failures === [];
     }
@@ -950,6 +1565,7 @@ final class PaymentService implements PaymentServiceContract
         array $piiKeys,
         bool $exclusive,
         ?array $bank = null,
+        bool $requiresApproval = false,
     ): Payment {
         $errors = [];
 
@@ -1031,6 +1647,7 @@ final class PaymentService implements PaymentServiceContract
                 $cleanPii,
                 $exclusive,
                 $bankAccount,
+                $requiresApproval,
             );
         } catch (\DomainException $e) {
             throw new ValidationException(['amount' => Messages::get('validation.payment', $e->getMessage())]);
@@ -1069,15 +1686,28 @@ final class PaymentService implements PaymentServiceContract
     }
 
     /**
-     * Per-payout and per-UTC-day caps, per currency.
+     * Per-payout minimum and maximum and per-UTC-day cap, per currency.
      *
-     * The daily sum counts PENDING payouts too — money that may already be on
-     * its way. Two payouts racing past the check together is bounded by the
-     * provider itself: MarzPay refuses a second payout while one is in flight
-     * (PENDING_WITHDRAWAL_EXISTS).
+     * FAILS CLOSED: once any cap is configured, a currency the caps do not
+     * name is refused — leaving it out must not mean "unlimited".
+     *
+     * The daily sum counts requested and pending payouts too — money promised
+     * or already on its way. $excluding is a request being approved: it is
+     * already in that sum when it was made today, and must not count twice.
      */
-    private function enforcePayoutLimits(Money $amount): void
+    private function enforcePayoutLimits(Money $amount, ?Payment $excluding = null): void
     {
+        $minimum = $this->payoutMinMinor[$amount->currency] ?? null;
+        if ($minimum !== null && $amount->minor < $minimum) {
+            throw PaymentException::payoutMinimum(Money::ofMinor($minimum, $amount->currency)->toMajor(), $amount->currency);
+        }
+
+        if (($this->payoutMaxMinor !== [] || $this->payoutDailyMaxMinor !== [])
+            && !isset($this->payoutMaxMinor[$amount->currency])
+            && !isset($this->payoutDailyMaxMinor[$amount->currency])) {
+            throw PaymentException::payoutCurrencyNotEnabled($amount->currency);
+        }
+
         $single = $this->payoutMaxMinor[$amount->currency] ?? null;
         if ($single !== null && $amount->minor > $single) {
             throw PaymentException::payoutLimit(Money::ofMinor($single, $amount->currency)->toMajor(), $amount->currency, 'single');
@@ -1086,7 +1716,11 @@ final class PaymentService implements PaymentServiceContract
         $daily = $this->payoutDailyMaxMinor[$amount->currency] ?? null;
         if ($daily !== null) {
             $startOfDay = $this->clock->now()->setTimezone(new \DateTimeZone('UTC'))->setTime(0, 0);
-            if ($this->store->payoutTotalSince($amount->currency, $startOfDay) + $amount->minor > $daily) {
+            $total      = $this->store->payoutTotalSince($amount->currency, $startOfDay);
+            if ($excluding !== null && $excluding->createdAt() >= $startOfDay) {
+                $total -= $excluding->amount()->minor;
+            }
+            if ($total + $amount->minor > $daily) {
                 throw PaymentException::payoutLimit(Money::ofMinor($daily, $amount->currency)->toMajor(), $amount->currency, 'daily');
             }
         }

@@ -13,7 +13,9 @@ use Plugins\Payment\Support\Messages;
 
 /**
  * Route filter `payment.rate_limit:{perMinute}` — a fixed one-minute window per
- * client IP, kept in CachePort.
+ * client IP, kept in CachePort. Used on the status poll (60) and the webhook
+ * (600: generous — MarzPay sends every callback from few addresses — but a
+ * ceiling on how fast anyone can make the plugin write and call out).
  *
  * The plugin registers this alias itself, so its public status route is
  * limited without requiring the SecurityFilters plugin. With no CachePort
@@ -42,7 +44,9 @@ final class StatusRateLimitStage implements HttpStageContract
         $cache  = $container->make(CachePort::class);
         $now    = $container->has(ClockPort::class) ? $container->make(ClockPort::class)->timestamp() : time();
         $window = intdiv($now, 60);
-        $key    = 'payment:rl:' . hash('sha256', (string) $request->ip()) . ':' . $window;
+        // The limit is part of the key: each route that declares its own limit
+        // (status poll 60, webhook 600) counts separately.
+        $key    = 'payment:rl:' . $limit . ':' . hash('sha256', (string) $request->ip()) . ':' . $window;
 
         try {
             if (!$cache->has($key)) {

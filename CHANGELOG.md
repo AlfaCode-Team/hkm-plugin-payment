@@ -6,6 +6,101 @@ All notable changes to this plugin are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-02
+
+### Changed
+
+- **A collection MarzPay confirms is always delivered.** When its amount or fee
+  does not add up (short, missing, unreadable, another currency, an
+  unexplained surplus, a fee that contradicts itself, is above 10% or is not
+  the agreed one), it now SETTLES — the customer gets what they paid for — and
+  is FLAGGED for an admin to check with MarzPay: `flagReason` / `flaggedAt` on
+  the payment, `flagReason` on the event, `check.flagged` in the history, an
+  error in the log, `PaymentQuery(flagged: true)`, and
+  `PaymentReviewContract::resolveFlag()` to clear it.
+  `PAYMENT_COLLECTION_MISMATCH=hold` keeps the old refusal for an amount that
+  cannot be accounted for. Not delivered, as before: a payment MarzPay has not
+  confirmed, and a confirmation that belongs to another payment.
+- `PAYMENT_WITHDRAW_APPROVAL=admin` now holds `payout()` and `transfer()` as
+  well as `withdraw()`; `PAYMENT_APPROVAL_ABOVE` (per currency) lets small
+  amounts through. A withdrawal request needs a signed-in user. Approval
+  re-checks the saved number and applies TODAY's limits (a request already
+  counted today is not counted twice).
+- `MarzPayServiceContract` methods that spend the wallet (bank transfer, bills,
+  airtime, data, WhatsApp money actions) need `PAYMENT_PAYOUT_PERMISSION` as
+  well as the admin one and respect `PAYMENT_PAYOUT_MAX`; under admin approval
+  the raw bank transfer and WhatsApp send/push/transfer are refused. A raw bank
+  transfer defaults to `wallet_source: main`.
+- Payout caps fail closed: once any is configured, a currency they do not name
+  is refused (`payment.payout_limit`, window `unconfigured`).
+- A webhook arriving within `PAYMENT_WEBHOOK_MIN_INTERVAL` is acknowledged
+  (200) instead of refused (429), so a forged callback cannot turn MarzPay's
+  genuine one into a refusal. The webhook route is rate-limited
+  (`payment.rate_limit:600`; the limiter now counts per configured limit).
+- Stored callback bodies are redacted (phone and bank numbers masked to their
+  last digits, names and e-mails and isPII metadata removed) and capped at
+  4 KB (1 KB for unsigned or unreadable ones).
+- Recording an announcement writes only `notified_at` / `notify_attempts`
+  (`PaymentStore::markNotified()`), so it can no longer revert a concurrent
+  write to the same payment.
+- An amount MarzPay reports unreadably no longer fails the status lookup.
+- Fee arithmetic cannot overflow at any rate or amount.
+- **Fees follow MarzPay's pricing exactly.** 1.1.2 assumed 3% on UGX and 4% on
+  every other currency. MarzPay actually prices by country, direction and
+  mobile-money network (Rwanda MTN 4.1% vs Airtel 3.5%; DRC Vodacom 3.5% vs
+  Airtel 4%; Kenya a fixed fee by band + 2%; Uganda payouts flat by band; …).
+  `MarzPayPricing` carries the full published schedule (all 12 countries,
+  collections, payouts, Uganda bank transfers and bills, as of 2026-10-02), and
+  `MARZPAY_COLLECTION_FEE_PERCENT` is now this business's AGREED collection
+  rate on top of it: default `*:2` (2% on every collection); `UG:2.5`,
+  `CD/vodacom:3` and empty (published only) are accepted. A malformed value
+  fails closed. The old default `UGX:3,*:4` is read as unset.
+- A collection settles when the reported amount is exactly what was asked, or
+  when amount − the `charge` MarzPay names (documented since its October 2026
+  update, with `net_amount`) is exactly what was asked. When no fee is named,
+  the surplus must be exactly the agreed fee for that country and network. A
+  named fee that contradicts `net_amount`, or exceeds 10% of the amount, is
+  not believed. Unsettled amounts journal the surplus and the expected fee.
+
+- Checked against MarzPay's webhooks page (2026-10-02): a `charge` of 0
+  ("no fee") is recorded but never flagged; Senegal's Free Money, reported as
+  `free`, is priced; a card payment (`provider: "card payments"`) is filed
+  under `card`; a failed collection records no fee even though its callback
+  carries one; a payout callback with `provider_reference: null` still settles
+  through the stored uuid.
+
+### Added
+
+- The fee is recorded on every payment: `network`, `fee_minor` and
+  `fee_paid_by` (`customer` | `business`), from MarzPay's `charge` on
+  collections, `withdrawal.charge` on payouts and `charge_amount` on bank
+  transfers. Migration `2026_10_02_000005` (central and tenant-template).
+- `PaymentDTO`: `network`, `feeMinor`, `fee`, `feePaidBy`, `walletAmountMinor`.
+  `PaymentSettledIntegrationEvent`: `network`, `feeMinor`, `feePaidBy`.
+- `check.fee_unexpected` journal entries and a warning when MarzPay names a fee
+  that is not the agreed (collection) or published (payout) one.
+- `PAYMENT_WITHDRAW_APPROVAL` — `self` (default: `withdraw()` sends at once,
+  as before) or `admin`: every withdrawal is recorded as a `requested`
+  payment, validated and counted against the payout caps, announced as
+  `payout.requested`, and sent only when an administrator approves it.
+  `WithdrawalApprovalContract::approveWithdrawal()` / `rejectWithdrawal()`
+  (`PAYMENT_WITHDRAW_APPROVER_PERMISSION`, default `payment:approve`). Nobody
+  may decide on their own request, a guest never can, and a request is decided
+  once (compare-and-set). New statuses `requested` and `rejected`; new event
+  `payout.rejected`; `reviewed_by` / `reviewed_at` on the payment (migration
+  `2026_10_02_000006`). An unknown mode fails closed.
+- `WithdrawalApprovalContract::cancelWithdrawal()` — the owner takes back a
+  request still waiting. `PaymentQuery` `ownerType` / `ownerId`.
+- `PAYMENT_PAYOUT_MIN` (per currency) and `payment.payout_minimum`.
+- `WithdrawDTO::$expectedName` — refuse a withdrawal to a number registered to
+  someone else (`payment.phone_name_mismatch`);
+  `PAYMENT_PHONE_VERIFICATION_MAX_AGE_DAYS` — refuse one verified too long ago.
+- `owner_type`, `owner_id`, `phone_number_id`, `flag_reason`, `flagged_at` on
+  `payments` (migration `2026_10_02_000006`, with `reviewed_by` / `reviewed_at`).
+- `PaymentFeesContract::quote()` — a fee quote before money moves, per network
+  or as a range. Its own contract, so implementations of
+  `PaymentServiceContract` are not broken.
+
 ## [1.1.2] - 2026-10-02
 
 ### Fixed

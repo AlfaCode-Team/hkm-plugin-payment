@@ -35,6 +35,9 @@ final class PaymentException extends ServiceException implements HttpStatusAware
     public const PHONE_NOT_VERIFIED   = 'payment.phone_not_verified';
     public const PHONE_LIMIT          = 'payment.phone_limit';
     public const LOOKUP_LIMIT         = 'payment.lookup_limit';
+    public const NOT_AWAITING_APPROVAL = 'payment.not_awaiting_approval';
+    public const PAYOUT_MINIMUM       = 'payment.payout_minimum';
+    public const PHONE_NAME_MISMATCH  = 'payment.phone_name_mismatch';
 
     /**
      * Provider codes a PAYER can act on → the message key and default shown.
@@ -250,6 +253,50 @@ final class PaymentException extends ServiceException implements HttpStatusAware
             Messages::get('phone_limit', 'At most :max phone numbers can be saved. Remove one first.', ['max' => $max]),
             422,
             ['max' => $max],
+        );
+    }
+
+    public static function payoutMinimum(string $minimum, string $currency): self
+    {
+        return new self(
+            self::PAYOUT_MINIMUM,
+            Messages::get('payout_minimum', 'The smallest amount that can be sent is :minimum :currency.', ['minimum' => $minimum, 'currency' => $currency]),
+            422,
+            ['minimum' => $minimum, 'currency' => $currency],
+        );
+    }
+
+    /** Payout caps are configured, and none names this currency: refused, never unlimited. */
+    public static function payoutCurrencyNotEnabled(string $currency): self
+    {
+        return new self(
+            self::PAYOUT_LIMIT,
+            Messages::get('payout_currency', 'Payouts in :currency are not enabled.', ['currency' => $currency]),
+            422,
+            ['currency' => $currency, 'window' => 'unconfigured'],
+        );
+    }
+
+    /** The saved number is registered to someone other than the person named. */
+    public static function phoneNameMismatch(string $id): self
+    {
+        return new self(
+            self::PHONE_NAME_MISMATCH,
+            Messages::get('phone_name_mismatch', 'This phone number is registered to someone else.'),
+            422,
+            ['phone_number_id' => $id],
+        );
+    }
+
+    /** Approve / reject on a payment that is not a withdrawal waiting for approval (any more). */
+    public static function notAwaitingApproval(string $reference, string $status): self
+    {
+        return new self(
+            self::NOT_AWAITING_APPROVAL,
+            Messages::get('not_awaiting_approval', 'This withdrawal is not waiting for approval (it is :status).', ['status' => $status]),
+            409,
+            ['reference' => $reference, 'status' => $status],
+            reference: $reference,
         );
     }
 

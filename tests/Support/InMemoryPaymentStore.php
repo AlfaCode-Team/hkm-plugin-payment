@@ -49,6 +49,23 @@ final class InMemoryPaymentStore implements PaymentStore
         return true;
     }
 
+    public function markNotified(Payment $payment, PaymentStatus $status): bool
+    {
+        $stored = $this->rows[$payment->reference()->value] ?? null;
+        if ($stored === null || $stored->status() !== $status) {
+            return false;
+        }
+        // Only the announcement bookkeeping, as the table does.
+        $copy = clone $stored;
+        (function (?\DateTimeImmutable $at, int $attempts): void {
+            $this->notifiedAt     = $at;
+            $this->notifyAttempts = $attempts;
+        })->call($copy, $payment->notifiedAt(), $payment->notifyAttempts());
+        $this->rows[$payment->reference()->value] = $copy;
+
+        return true;
+    }
+
     public function find(PaymentReference $reference): ?Payment
     {
         return isset($this->rows[$reference->value]) ? clone $this->rows[$reference->value] : null;
@@ -83,7 +100,7 @@ final class InMemoryPaymentStore implements PaymentStore
             $this->rows,
             static fn(Payment $p): bool => $p->status() !== PaymentStatus::Pending
                 && $p->notifiedAt() === null
-                && $p->settledAt() !== null && $p->settledAt() < $settledBefore
+                && ($p->settledAt() ?? $p->createdAt()) < $settledBefore
                 && $p->notifyAttempts() < $maxAttempts,
         );
 
@@ -97,7 +114,7 @@ final class InMemoryPaymentStore implements PaymentStore
             if ($p->direction() === PaymentDirection::Payout
                 && $p->amount()->currency === $currency
                 && $p->createdAt() >= $since
-                && \in_array($p->status(), [PaymentStatus::Pending, PaymentStatus::Succeeded], true)) {
+                && \in_array($p->status(), [PaymentStatus::Requested, PaymentStatus::Pending, PaymentStatus::Succeeded], true)) {
                 $total += $p->amount()->minor;
             }
         }
@@ -121,7 +138,9 @@ final class InMemoryPaymentStore implements PaymentStore
             ($query->status === null || $p->status()->value === $query->status)
             && ($query->direction === null || $p->direction()->value === $query->direction)
             && ($query->subjectType === null || $p->subjectType() === $query->subjectType)
-            && ($query->subjectId === null || $p->subjectId() === $query->subjectId)));
+            && ($query->subjectId === null || $p->subjectId() === $query->subjectId)
+            && ($query->flagged === null || ($p->flagReason() !== null) === $query->flagged)
+            && ($query->ownerType === null || $query->ownerId === null || $p->belongsTo($query->ownerType, $query->ownerId))));
 
         return [
             'items' => array_map(static fn(Payment $p): Payment => clone $p, \array_slice($rows, $query->offset(), $query->perPage)),

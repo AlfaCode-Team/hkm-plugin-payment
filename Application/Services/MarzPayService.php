@@ -11,6 +11,7 @@ use AlfacodeTeam\PhpServicePlatform\Kernel\Security\Identity;
 use Plugins\Payment\API\Contracts\MarzPayServiceContract;
 use Plugins\Payment\API\Exceptions\PaymentException;
 use Plugins\Payment\Application\Gateway\ProviderRejectedException;
+use Plugins\Payment\Domain\ValueObjects\Money;
 use Plugins\Payment\Domain\ValueObjects\PaymentReference;
 use Plugins\Payment\Infrastructure\Gateways\MarzPay\MarzPayClient;
 use Plugins\Payment\Support\Messages;
@@ -35,10 +36,26 @@ final class MarzPayService implements MarzPayServiceContract
 
     private const USSD_ACTIONS = ['process', 'pin/status', 'pin/create', 'pin/verify', 'business-by-phone'];
 
+    /** WhatsApp actions that spend the business's money. */
+    private const WHATSAPP_MONEY_OUT = ['send-money', 'push-to-bank', 'pay-utility-bill', 'pay-merchant', 'pay-merchant-product', 'transfer-wallet'];
+
+    /**
+     * Money-out actions that have a ledger equivalent (withdraw / payout /
+     * transfer). Under admin approval they are refused here: sent raw, they
+     * would skip the approval, the daily caps and the payments ledger.
+     */
+    private const BYPASSES_APPROVAL = ['send-money', 'push-to-bank', 'transfer-wallet'];
+
+    /**
+     * @param array<string, int> $payoutMaxMinor currency → largest single payout (PAYMENT_PAYOUT_MAX)
+     */
     public function __construct(
         private readonly MarzPayClient $client,
         private readonly Identity $identity,
         private readonly string $adminPermission = 'payment:manage',
+        private readonly string $payoutPermission = 'payment:payout',
+        private readonly string $withdrawApproval = 'self',
+        private readonly array $payoutMaxMinor = [],
     ) {
     }
 
@@ -132,6 +149,9 @@ final class MarzPayService implements MarzPayServiceContract
     public function bankTransfer(array $payload): array
     {
         $this->require($payload, ['amount', 'bank_name', 'bank_account_number', 'bank_account_name']);
+        $this->moneyOut('bank-transfer', $payload['amount'] ?? null, approvalBypass: true);
+        // Never from the card wallet unless asked for explicitly.
+        $payload['wallet_source'] ??= 'main';
 
         return $this->call(fn() => $this->client->post('/bank-transfer', $payload));
     }
@@ -178,6 +198,7 @@ final class MarzPayService implements MarzPayServiceContract
     public function payBill(array $payload): array
     {
         $this->require($payload, ['utility_code', 'meter_number', 'amount']);
+        $this->moneyOut('bill-payment', $payload['amount'] ?? null);
         $payload['utility_code'] = self::utility((string) $payload['utility_code']);
         $payload['reference']  ??= (string) PaymentReference::generate();
 
@@ -209,6 +230,7 @@ final class MarzPayService implements MarzPayServiceContract
     public function buyAirtime(string $msisdn, int $amount, ?string $reference = null): array
     {
         $this->authorize();
+        $this->moneyOut('airtime', $amount);
         if ($amount <= 0) {
             throw new ValidationException(['amount' => Messages::get('validation.amount', 'Amount must be greater than zero.')]);
         }
@@ -224,6 +246,9 @@ final class MarzPayService implements MarzPayServiceContract
 
     public function buyDataBundle(string $msisdn, string $bundleId, ?string $reference = null): array
     {
+        $this->authorize();
+        $this->moneyOut('data-bundle', null);
+
         return $this->call(fn() => $this->client->post('/airtime-data', [
             'reference'     => $reference ?? (string) PaymentReference::generate(),
             'purchase_type' => 'bundle',
@@ -316,6 +341,9 @@ final class MarzPayService implements MarzPayServiceContract
         $method = self::WHATSAPP_ACTIONS[$action] ?? throw new ValidationException([
             'action' => Messages::get('validation.action', 'Unknown action [:action].', ['action' => $action]),
         ]);
+        if (\in_array($action, self::WHATSAPP_MONEY_OUT, true)) {
+            $this->moneyOut('whatsapp/' . $action, $payload['amount'] ?? null, \in_array($action, self::BYPASSES_APPROVAL, true));
+        }
 
         return $this->call(fn() => $method === 'GET'
             ? $this->client->get('/whatsapp/' . $action)
@@ -355,6 +383,46 @@ final class MarzPayService implements MarzPayServiceContract
         }
 
         return $unwrap && \is_array($body['data'] ?? null) ? $body['data'] : $body;
+    }
+
+    /**
+     * Gate for calls that SPEND the business's money: the payout permission on
+     * top of the admin one, the per-payout cap where one is configured (these
+     * products are Uganda-only: UGX), and — under admin approval — a refusal
+     * for the ones that would bypass it.
+     */
+    private function moneyOut(string $operation, mixed $amount, bool $approvalBypass = false): void
+    {
+        if ($this->payoutPermission !== '' && !$this->identity->hasPermission($this->payoutPermission)) {
+            throw new SecurityException(
+                Messages::get('forbidden', 'You are not allowed to manage payments.'),
+                layer:   'payment.forbidden',
+                context: ['permission' => $this->payoutPermission, 'operation' => $operation],
+                code:    403,
+            );
+        }
+        if ($approvalBypass && $this->withdrawApproval === 'admin') {
+            throw new SecurityException(
+                Messages::get('approval_required', 'Money out must be approved by an administrator — use withdraw(), payout() or transfer().'),
+                layer:   'payment.approval_required',
+                context: ['operation' => $operation],
+                code:    403,
+            );
+        }
+        if ($this->payoutMaxMinor !== [] && $amount !== null && (\is_int($amount) || \is_float($amount) || \is_string($amount))) {
+            try {
+                $money = Money::ofMajor($amount, 'UGX');
+            } catch (\DomainException $e) {
+                throw new ValidationException(['amount' => Messages::get('validation.amount', $e->getMessage())]);
+            }
+            $cap = $this->payoutMaxMinor['UGX'] ?? null;
+            if ($cap === null) {
+                throw PaymentException::payoutCurrencyNotEnabled('UGX');
+            }
+            if ($money->minor > $cap) {
+                throw PaymentException::payoutLimit(Money::ofMinor($cap, 'UGX')->toMajor(), 'UGX', 'single');
+            }
+        }
     }
 
     private function authorize(): void

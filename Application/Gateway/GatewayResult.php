@@ -26,10 +26,23 @@ final readonly class GatewayResult
         public ?Money $amount = null,
         public ?string $failureCode = null,
         public ?string $failureMessage = null,
-        // The provider's own charge INCLUDED in `amount`, when the provider
-        // reports the gross (MarzPay adds 3-4% to a collection). The service
-        // then checks amount - providerFee against what was asked.
+        // The provider's charge on this movement. For a collection it is either
+        // REPORTED by the provider (MarzPay's `charge`), or — when the provider
+        // reports a gross amount without naming its charge — INFERRED from the
+        // fee schedule because the surplus is exactly the scheduled fee.
         public ?Money $providerFee = null,
+        // true: the provider named the fee; false: it was inferred.
+        public bool $feeReported = false,
+        // The mobile-money network that carried it (mtn, airtel, mpesa, …), or
+        // "card"; null when the provider did not say.
+        public ?string $network = null,
+        // The provider named a fee or net amount that could not be used (they
+        // disagree, another currency, unreadable) — why. Settlement does not
+        // rely on it, but a person should look.
+        public ?string $feeAnomaly = null,
+        // The provider reported an amount that could not be read — why. With
+        // `amount` null, the amount was not checked.
+        public ?string $amountAnomaly = null,
     ) {
     }
 }

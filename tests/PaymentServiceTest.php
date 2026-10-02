@@ -366,45 +366,27 @@ final class PaymentServiceTest extends TestCase
         self::assertSame(PaymentStatus::Pending, $this->store->only()->status());
     }
 
-    public function test_a_cdf_amount_reported_with_marzpays_4_percent_fee_is_settled(): void
+    public function test_a_confirmed_amount_that_differs_is_delivered_and_flagged(): void
     {
+        // MarzPay's own API says COMPLETED for this payment: the customer paid.
+        // 500 of 5,000 is not what was asked — an admin checks it with MarzPay,
+        // and the order is not held hostage meanwhile.
         $service = $this->service();
-        // 5,047.00 CDF asked; MarzPay reports 5,248.88 — the same plus its 4%.
-        $payment = $this->collect($service, ['amount' => '5047.00', 'phoneNumber' => '+243812345678', 'country' => 'CD', 'currency' => 'CDF']);
-        $this->http->on('GET', '/transactions/' . self::UUID, 200, F::collectionCallback($payment->reference, self::UUID, 'completed', 5248.88, 'CDF'));
+        $payment = $this->collect($service);
+        $this->http->on('GET', '/transactions/' . self::UUID, 200, F::collectionCallback($payment->reference, self::UUID, 'completed', 500));
 
         $this->webhook($service, F::collectionCallback($payment->reference, self::UUID));
 
-        self::assertSame(PaymentStatus::Succeeded, $this->store->only()->status());
+        $stored = $this->store->only();
+        self::assertSame(PaymentStatus::Succeeded, $stored->status());
+        self::assertStringContainsString('4500 short', (string) $stored->flagReason());
         self::assertSame(['payment.succeeded'], $this->listener->names());
+        self::assertSame($stored->flagReason(), $this->listener->events[0]->payload()['flagReason']);
     }
 
-    public function test_a_ugx_amount_reported_with_marzpays_3_percent_fee_is_settled(): void
+    public function test_with_hold_a_confirmed_amount_that_differs_is_not_settled(): void
     {
-        $service = $this->service();
-        $payment = $this->collect($service);   // 5,000 UGX
-        $this->http->on('GET', '/transactions/' . self::UUID, 200, F::collectionCallback($payment->reference, self::UUID, 'completed', 5150));
-
-        $this->webhook($service, F::collectionCallback($payment->reference, self::UUID));
-
-        self::assertSame(PaymentStatus::Succeeded, $this->store->only()->status());
-    }
-
-    public function test_a_surplus_that_is_not_marzpays_fee_is_not_settled(): void
-    {
-        $service = $this->service();
-        $payment = $this->collect($service);   // 5,000 UGX: the fee is 3%, so 5,200 is unexplained
-        $this->http->on('GET', '/transactions/' . self::UUID, 200, F::collectionCallback($payment->reference, self::UUID, 'completed', 5200));
-
-        $this->webhook($service, F::collectionCallback($payment->reference, self::UUID));
-
-        self::assertSame(PaymentStatus::Pending, $this->store->only()->status());
-        self::assertSame([], $this->listener->events);
-    }
-
-    public function test_a_confirmed_amount_that_differs_is_not_settled(): void
-    {
-        $service = $this->service();
+        $service = $this->service(options: ['collectionMismatch' => 'hold']);
         $payment = $this->collect($service);
         $this->http->on('GET', '/transactions/' . self::UUID, 200, F::collectionCallback($payment->reference, self::UUID, 'completed', 500));
 
@@ -412,6 +394,20 @@ final class PaymentServiceTest extends TestCase
 
         self::assertSame(PaymentStatus::Pending, $this->store->only()->status());
         self::assertSame([], $this->listener->events);
+    }
+
+    public function test_a_status_that_belongs_to_another_payment_is_never_delivered(): void
+    {
+        // The one thing that is NOT an inconsistency to deliver through: the
+        // confirmation is for someone else's payment.
+        $service = $this->service();
+        $payment = $this->collect($service);
+        $this->http->on('GET', '/transactions/' . self::UUID, 200, F::collectionCallback('11111111-1111-4111-8111-111111111111', self::UUID));
+
+        $this->webhook($service, F::collectionCallback($payment->reference, self::UUID));
+
+        self::assertSame(PaymentStatus::Pending, $this->store->only()->status());
+        self::assertNull($this->store->only()->flagReason());
     }
 
     public function test_a_status_owned_by_another_reference_is_not_settled(): void
@@ -558,6 +554,42 @@ final class PaymentServiceTest extends TestCase
 
         self::assertSame(['payout.succeeded'], $this->listener->names());
         self::assertSame('AIRTEL_MONEY_ID', $this->store->only()->providerTransactionId());
+    }
+
+    public function test_a_payout_callback_without_our_reference_still_settles_by_the_stored_uuid(): void
+    {
+        // The webhooks page (2026-10-02) shows Uganda disbursement callbacks with
+        // provider_reference: null and recipient_name — no reference of ours at all.
+        $service = $this->service(Identity::asUser('admin-1', permissions: ['payment:payout']));
+        $this->http->on('POST', '/send-money', 201, F::payoutCreated('__ours__', self::UUID, 'marz-system-ref'));
+        $payout = $service->payout(new PayoutDTO(amount: 10000, phoneNumber: '+256712345678'));
+
+        $documented = F::disbursementCallback($payout->reference, self::UUID);
+        $documented['transaction']['provider_reference']  = null;
+        $documented['transaction']['reference']           = 'transaction-reference';
+        $documented['transaction']['recipient_name']      = 'Katende Nicholas';
+        $documented['disbursement']['provider_reference'] = null;
+        $documented['disbursement']['recipient_name']     = 'Katende Nicholas';
+
+        $this->http->on('GET', '/transactions/' . self::UUID, 200, $documented);
+        $this->webhook($service, $documented);
+
+        self::assertSame(PaymentStatus::Succeeded, $this->store->only()->status(), 'found by the uuid we stored, confirmed by asking with it');
+        self::assertSame(['payout.succeeded'], $this->listener->names());
+    }
+
+    public function test_a_payout_callback_naming_nothing_we_stored_settles_nothing(): void
+    {
+        $service = $this->service(Identity::asUser('admin-1', permissions: ['payment:payout']));
+        $this->http->on('POST', '/send-money', 201, F::payoutCreated('__ours__', self::UUID, 'marz-system-ref'));
+        $service->payout(new PayoutDTO(amount: 10000, phoneNumber: '+256712345678'));
+
+        $foreign = F::disbursementCallback('', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+        $foreign['transaction']['provider_reference'] = null;
+        $this->webhook($service, $foreign);
+
+        self::assertSame(PaymentStatus::Pending, $this->store->only()->status());
+        self::assertSame(0, $this->http->count('GET', '/transactions/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'));
     }
 
     public function test_a_payout_already_in_flight_is_a_409(): void
@@ -763,13 +795,10 @@ final class PaymentServiceTest extends TestCase
 
         $this->webhook($service, F::collectionCallback($payment->reference, self::UUID)); // checks, still processing
 
-        try {
-            $this->webhook($service, F::collectionCallback($payment->reference, self::UUID));
-            self::fail('expected a throttle');
-        } catch (PaymentException $e) {
-            self::assertSame(PaymentException::THROTTLED, $e->code());
-            self::assertSame(429, $e->httpStatus());
-        }
+        // A second callback seconds later is ACKNOWLEDGED (no 429 — a fake one
+        // must not turn MarzPay's genuine callback into a refusal) but costs no
+        // provider call.
+        $this->webhook($service, F::collectionCallback($payment->reference, self::UUID));
         self::assertSame(1, $this->http->count('GET', '/transactions/' . self::UUID));
 
         $this->clock->advance(6);

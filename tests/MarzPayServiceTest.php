@@ -31,11 +31,12 @@ final class MarzPayServiceTest extends TestCase
         $this->http = new FakeHttpClient();
     }
 
-    private function service(?Identity $identity = null): MarzPayService
+    private function service(?Identity $identity = null, array $options = []): MarzPayService
     {
         return new MarzPayService(
             new MarzPayClient($this->http, 'https://wallet.wearemarz.com/api/v1', 'key', 'secret'),
-            $identity ?? Identity::asUser('admin', permissions: ['payment:manage']),
+            $identity ?? Identity::asUser('admin', permissions: ['payment:manage', 'payment:payout']),
+            ...$options,
         );
     }
 
@@ -169,5 +170,81 @@ final class MarzPayServiceTest extends TestCase
             self::assertStringNotContainsString('10.0.0.9', $e->getMessage());
             self::assertSame('IP 10.0.0.9 is not whitelisted', $e->providerMessage);
         }
+    }
+
+    // ── money out ───────────────────────────────────────────────────────────
+
+    /** @return array<string, array{\Closure(MarzPayService): mixed}> */
+    public static function moneyOut(): array
+    {
+        return [
+            'bank transfer'        => [static fn(MarzPayService $s) => $s->bankTransfer(['amount' => 10000, 'bank_name' => 'Equity Bank', 'bank_account_number' => '60001256421', 'bank_account_name' => 'John Doe'])],
+            'pay bill'             => [static fn(MarzPayService $s) => $s->payBill(['utility_code' => 'LIGHT', 'meter_number' => '1', 'amount' => 10000])],
+            'buy airtime'          => [static fn(MarzPayService $s) => $s->buyAirtime('256771234567', 5000)],
+            'buy bundle'           => [static fn(MarzPayService $s) => $s->buyDataBundle('256771234567', 'RACT_UG_Data_201')],
+            'whatsapp send-money'  => [static fn(MarzPayService $s) => $s->whatsapp('send-money', ['amount' => 1000])],
+            'whatsapp transfer'    => [static fn(MarzPayService $s) => $s->whatsapp('transfer-wallet', ['amount' => 1000])],
+            'whatsapp pay-merchant'=> [static fn(MarzPayService $s) => $s->whatsapp('pay-merchant', ['amount' => 1000])],
+        ];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('moneyOut')]
+    public function test_spending_the_wallet_needs_the_payout_permission_not_just_manage(\Closure $call): void
+    {
+        try {
+            $call($this->service(Identity::asUser('support', permissions: ['payment:manage'])));
+            self::fail('payment:manage alone must not spend money');
+        } catch (\AlfacodeTeam\PhpServicePlatform\Kernel\Exceptions\SecurityException $e) {
+            self::assertSame(403, $e->getCode());
+        }
+        self::assertSame([], $this->http->requests);
+    }
+
+    public function test_under_admin_approval_raw_money_out_that_bypasses_it_is_refused(): void
+    {
+        $service = $this->service(options: ['withdrawApproval' => 'admin']);
+
+        foreach ([
+            static fn() => $service->bankTransfer(['amount' => 10000, 'bank_name' => 'Equity Bank', 'bank_account_number' => '60001256421', 'bank_account_name' => 'John Doe']),
+            static fn() => $service->whatsapp('send-money', ['amount' => 1000]),
+            static fn() => $service->whatsapp('push-to-bank', ['amount' => 1000]),
+            static fn() => $service->whatsapp('transfer-wallet', ['amount' => 1000]),
+        ] as $call) {
+            try {
+                $call();
+                self::fail('bypasses the approval');
+            } catch (\AlfacodeTeam\PhpServicePlatform\Kernel\Exceptions\SecurityException $e) {
+                self::assertSame('payment.approval_required', $e->layer);
+            }
+        }
+        self::assertSame([], $this->http->requests);
+    }
+
+    public function test_the_per_payout_cap_applies_to_raw_money_out(): void
+    {
+        $service = $this->service(options: ['payoutMaxMinor' => ['UGX' => 50000]]);
+
+        try {
+            $service->payBill(['utility_code' => 'LIGHT', 'meter_number' => '1', 'amount' => 50001]);
+            self::fail('above the cap');
+        } catch (\Plugins\Payment\API\Exceptions\PaymentException $e) {
+            self::assertSame(\Plugins\Payment\API\Exceptions\PaymentException::PAYOUT_LIMIT, $e->code());
+        }
+
+        try {
+            $this->service(options: ['payoutMaxMinor' => ['KES' => 1000]])->buyAirtime('256771234567', 5000);
+            self::fail('caps configured, UGX not among them: refused, not unlimited');
+        } catch (\Plugins\Payment\API\Exceptions\PaymentException $e) {
+            self::assertSame(\Plugins\Payment\API\Exceptions\PaymentException::PAYOUT_LIMIT, $e->code());
+        }
+        self::assertSame([], $this->http->requests);
+    }
+
+    public function test_a_raw_bank_transfer_is_drawn_from_the_main_wallet_unless_asked_otherwise(): void
+    {
+        $this->http->on('POST', '/bank-transfer', 201, ['status' => 'success', 'data' => ['bank_transfer' => ['reference' => 'r']]]);
+        $this->service()->bankTransfer(['amount' => 10000, 'bank_name' => 'Equity Bank', 'bank_account_number' => '60001256421', 'bank_account_name' => 'John Doe']);
+
+        self::assertSame('main', $this->http->sentJson('POST', '/bank-transfer')['wallet_source']);
     }
 }

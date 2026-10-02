@@ -36,6 +36,14 @@ interface PaymentStore
 
     public function find(PaymentReference $reference): ?Payment;
 
+    /**
+     * Record an announcement attempt — notified_at and notify_attempts ONLY,
+     * and only while the stored status is still $status. Writing nothing else
+     * means a concurrent write to any other column (a fee, a flag, a check
+     * time) can never be reverted by the outbox's bookkeeping.
+     */
+    public function markNotified(Payment $payment, PaymentStatus $status): bool;
+
     public function findByProviderUuid(string $provider, string $providerUuid): ?Payment;
 
     /**

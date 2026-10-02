@@ -78,21 +78,37 @@ final class MarzPayFixtures
         string $status = 'completed',
         int|float $raw = 5000,
         string $currency = 'UGX',
+        string $network = 'mtn',
+        int|float|null $charge = null,
+        int|float|null $net = null,
     ): array {
+        $money = static fn(int|float $v): array => ['formatted' => number_format((float) $v, 2), 'raw' => $v, 'currency' => $currency];
+        // Documented since the October 2026 update: `charge` (MarzPay's fee) and
+        // `net_amount` (amount − charge) next to `amount`.
+        $fees = [];
+        if ($charge !== null) {
+            $fees['charge'] = $money($charge);
+        }
+        if ($net !== null) {
+            $fees['net_amount'] = $money($net);
+        }
+
         return [
             'event_type'  => 'collection.' . $status,
             'transaction' => [
                 'uuid'         => $uuid,
                 'reference'    => $reference,
                 'status'       => $status,
-                'amount'       => ['formatted' => number_format((float) $raw, 2), 'raw' => $raw, 'currency' => $currency],
-                'provider'     => 'mtn',
+                'amount'       => $money($raw),
+            ] + $fees + [
+                'provider'     => $network,
                 'phone_number' => '+256712345678',
             ],
             'collection' => [
-                'provider'                => 'mtn',
+                'provider'                => $network,
                 'phone_number'            => '+256712345678',
-                'amount'                  => ['formatted' => number_format((float) $raw, 2), 'raw' => $raw, 'currency' => $currency],
+                'amount'                  => $money($raw),
+            ] + $fees + [
                 'mode'                    => 'mtnuganda',
                 'provider_transaction_id' => '148769164724',
             ],

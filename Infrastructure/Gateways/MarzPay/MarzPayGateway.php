@@ -15,7 +15,9 @@ use Plugins\Payment\Application\Gateway\ProviderRejectedException;
 use Plugins\Payment\Application\Ports\BankTransferGateway;
 use Plugins\Payment\Application\Ports\PaymentGateway;
 use Plugins\Payment\Application\Ports\PhoneVerificationGateway;
+use Plugins\Payment\Application\Ports\PricedGateway;
 use Plugins\Payment\Domain\Entities\Payment;
+use Plugins\Payment\Domain\Fees\FeeSchedule;
 use Plugins\Payment\Domain\ValueObjects\Market;
 use Plugins\Payment\Domain\ValueObjects\Money;
 use Plugins\Payment\Domain\ValueObjects\PaymentDirection;
@@ -43,7 +45,7 @@ use Plugins\Payment\Domain\ValueObjects\PhoneVerificationStatus;
  *               the provider uuid and polled at GET /bank-transfer/{reference}.
  *               There are no bank-transfer callbacks.
  */
-final class MarzPayGateway implements PaymentGateway, PhoneVerificationGateway, BankTransferGateway
+final class MarzPayGateway implements PaymentGateway, PhoneVerificationGateway, BankTransferGateway, PricedGateway
 {
     public const NAME = 'marzpay';
 
@@ -63,15 +65,11 @@ final class MarzPayGateway implements PaymentGateway, PhoneVerificationGateway, 
     /** verification_status words that mean the lookup did not verify the number. */
     private const NOT_VERIFIED_WORDS = ['failed', 'not_found', 'not_verified', 'unverified', 'invalid', 'not_registered', 'unregistered'];
 
-    /** MarzPay's charge on a collection, percent per currency ('*' = any other). */
-    public const COLLECTION_FEE_PERCENT = ['UGX' => '3', '*' => '4'];
-
     /**
      * @param list<string> $checkoutHosts hosts a card redirect_url may point at
      *                                    (default: MarzPay's own wallet host)
-     * @param array<string,string> $collectionFeePercent MarzPay's charge on a
-     *        collection, percent per currency ('*' = every other currency) —
-     *        the amount a lookup reports may include it (see includedFee())
+     * @param ?FeeSchedule $fees MarzPay's fees — its published rates
+     *        (MarzPayPricing) with the business's own on top; null = published
      */
     public function __construct(
         private readonly MarzPayClient $client,
@@ -79,8 +77,14 @@ final class MarzPayGateway implements PaymentGateway, PhoneVerificationGateway, 
         private readonly string $webhookSecret = '',
         private readonly int $signatureTolerance = 300,
         private readonly array $checkoutHosts = ['wallet.wearemarz.com'],
-        private readonly array $collectionFeePercent = self::COLLECTION_FEE_PERCENT,
+        private ?FeeSchedule $fees = null,
     ) {
+        $this->fees ??= MarzPayPricing::published();
+    }
+
+    public function fees(): FeeSchedule
+    {
+        return $this->fees ?? MarzPayPricing::published();
     }
 
     public function name(): string
@@ -107,6 +111,7 @@ final class MarzPayGateway implements PaymentGateway, PhoneVerificationGateway, 
             providerUuid:      self::str($transaction['uuid'] ?? null),
             providerReference: self::str($transaction['provider_reference'] ?? null),
             redirectUrl:       $this->checkoutUrl(self::str($data['redirect_url'] ?? null)),
+            network:           self::network($payment, self::arr($data['collection'] ?? null), $transaction),
         );
     }
 
@@ -117,12 +122,18 @@ final class MarzPayGateway implements PaymentGateway, PhoneVerificationGateway, 
 
         $data        = self::data($this->client->post('/send-money', $body));
         $transaction = self::arr($data['transaction'] ?? null);
+        // Live create says `withdrawal`; sandbox may say `disbursement`.
+        $detail      = self::arr($data['withdrawal'] ?? $data['disbursement'] ?? null);
+        $fee         = self::charge($detail['charge'] ?? null, $payment->amount()->currency);
 
         return new GatewayResult(
             status:            self::mapStatus(self::str($transaction['status'] ?? null)),
             reference:         self::str($transaction['provider_reference'] ?? null),
             providerUuid:      self::str($transaction['uuid'] ?? null),
             providerReference: self::str($transaction['reference'] ?? null),
+            providerFee:       $fee,
+            feeReported:       $fee !== null,
+            network:           self::network($payment, $detail, $transaction),
         );
     }
 
@@ -160,7 +171,49 @@ final class MarzPayGateway implements PaymentGateway, PhoneVerificationGateway, 
             self::str($transaction['status'] ?? null),
             self::str($payload['event_type'] ?? null),
         );
-        $amount = self::money($transaction['amount'] ?? null);
+        // An amount that is missing or unreadable is reported, not thrown: the
+        // provider has still said whether the money moved, and that decides.
+        $amountAnomaly = null;
+        try {
+            $amount = self::money($transaction['amount'] ?? null);
+        } catch (GatewayException $e) {
+            $amount        = null;
+            $amountAnomaly = $e->getMessage();
+        }
+        if ($amount === null && $amountAnomaly === null) {
+            $amountAnomaly = 'MarzPay reported no amount';
+        }
+        $network = self::network($payment, $detail, $transaction);
+
+        // The fee MarzPay NAMES (documented on collection callbacks: `charge`,
+        // with `net_amount` = amount − charge). Ignored when the two disagree —
+        // a fee that does not add up is not one to settle money on.
+        $rawFee   = $transaction['charge'] ?? $detail['charge'] ?? null;
+        $rawNet   = $transaction['net_amount'] ?? $detail['net_amount'] ?? null;
+        $fee      = self::charge($rawFee, $payment->amount()->currency);
+        $net      = self::charge($rawNet, $payment->amount()->currency);
+        $named    = $rawFee !== null || $rawNet !== null;
+        $anomaly  = null;
+        if ($rawFee !== null && $fee === null) {
+            $anomaly = 'the reported charge is unreadable or in another currency';
+        } elseif ($rawNet !== null && $net === null) {
+            $anomaly = 'the reported net_amount is unreadable or in another currency';
+        } elseif ($fee !== null && $net !== null && ($amount === null || $amount->minor - $fee->minor !== $net->minor)) {
+            $anomaly = sprintf('charge %s and net_amount %s do not add up to the amount', $fee->toMajor(), $net->toMajor());
+            $fee     = null;
+        } elseif ($fee === null && $net !== null && $amount !== null) {
+            // Only the net was named: the fee is what it leaves out.
+            $fee = $amount->minor >= $net->minor ? Money::ofMinor($amount->minor - $net->minor, $amount->currency) : null;
+            if ($fee === null) {
+                $anomaly = 'the reported net_amount is larger than the amount';
+            }
+        }
+        $reported = $fee !== null;
+        // Infer a fee only when MarzPay said NOTHING about one. A fee it named
+        // that does not add up is a contradiction, not a gap to fill in.
+        if (!$named && !$isPayout) {
+            $fee = $this->inferredFee($payment, $amount, $network);
+        }
 
         return new GatewayResult(
             status:                $status,
@@ -169,7 +222,11 @@ final class MarzPayGateway implements PaymentGateway, PhoneVerificationGateway, 
             providerReference:     $isPayout ? self::str($transaction['reference'] ?? null) : null,
             providerTransactionId: self::str($detail['provider_transaction_id'] ?? null),
             amount:                $amount,
-            providerFee:           $isPayout ? null : $this->includedFee($payment->amount(), $amount),
+            providerFee:           $fee,
+            feeReported:           $reported,
+            network:               $network,
+            feeAnomaly:            $anomaly,
+            amountAnomaly:         $amountAnomaly,
             // The provider's own word when it is the one that decided, else
             // the outcome the event named ("marzpay.failed", not ".processing").
             failureCode:           $status->isFinal() && $status !== PaymentStatus::Succeeded
@@ -278,11 +335,15 @@ final class MarzPayGateway implements PaymentGateway, PhoneVerificationGateway, 
             throw new GatewayException('MarzPay accepted a bank transfer without naming it.', layer: MarzPayClient::LAYER);
         }
 
+        $fee = self::charge($transfer['charge_amount'] ?? $transfer['charge'] ?? null, $payment->amount()->currency);
+
         return new GatewayResult(
             status:                self::mapStatus(self::str($transfer['status'] ?? null)),
             providerUuid:          $id,
             providerReference:     self::str($transfer['transaction_uuid'] ?? null),
             providerTransactionId: self::str(self::arr($transfer['provider'] ?? null)['transaction_id'] ?? null),
+            providerFee:           $fee,
+            feeReported:           $fee !== null,
         );
     }
 
@@ -306,6 +367,8 @@ final class MarzPayGateway implements PaymentGateway, PhoneVerificationGateway, 
         $word     = self::str($transfer['status'] ?? null);
         $status   = self::mapStatus($word);
         $provider = self::arr($transfer['provider'] ?? null);
+        $amount   = self::money($transfer['amount'] ?? null);
+        $fee      = $amount !== null ? self::charge($transfer['charge_amount'] ?? $transfer['charge'] ?? null, $amount->currency) : null;
 
         return new GatewayResult(
             status:                $status,
@@ -315,7 +378,9 @@ final class MarzPayGateway implements PaymentGateway, PhoneVerificationGateway, 
             providerUuid:          self::str($transfer['reference'] ?? null) ?? $reference,
             providerReference:     self::str($transfer['transaction_uuid'] ?? null),
             providerTransactionId: self::str($provider['transaction_id'] ?? null),
-            amount:                self::money($transfer['amount'] ?? null),
+            amount:                $amount,
+            providerFee:           $fee,
+            feeReported:           $fee !== null,
             failureCode:           $status->isFinal() && $status !== PaymentStatus::Succeeded ? 'marzpay.' . ($word ?? $status->value) : null,
             failureMessage:        $status->isFinal() && $status !== PaymentStatus::Succeeded ? self::str($provider['status_description'] ?? null) : null,
         );
@@ -477,40 +542,66 @@ final class MarzPayGateway implements PaymentGateway, PhoneVerificationGateway, 
     }
 
     /**
-     * MarzPay's fee, when the amount it reports for a collection is what we
-     * asked PLUS its charge: 5,047.00 CDF asked comes back as 5,248.88 (4%),
-     * 5,000 UGX as 5,150 (3%). Sometimes it reports the bare amount; then
-     * there is no fee to account for and this is null.
+     * The fee inside a collection's reported amount when MarzPay reports the
+     * GROSS (what was asked plus its charge, e.g. 5,047.00 CDF asked comes
+     * back as 5,248.88) WITHOUT naming the charge.
      *
-     * Only an amount that matches the schedule is explained this way — the
-     * exact fee, its rounding either way by one minor unit, or rounded to a
-     * whole unit of the currency. Anything else stays unexplained, and the
-     * service refuses to settle a payment whose amount it cannot account for.
+     * Only a surplus that is exactly the scheduled fee for this country and
+     * network counts — the business's own agreed rate where one is set, else
+     * the published one. Anything else is unexplained (null), and the service
+     * refuses to settle a payment whose amount it cannot account for.
      */
-    private function includedFee(Money $asked, ?Money $reported): ?Money
+    private function inferredFee(Payment $payment, ?Money $reported, ?string $network): ?Money
     {
+        $asked = $payment->amount();
         if ($reported === null || $reported->currency !== $asked->currency || $reported->minor <= $asked->minor) {
             return null;
         }
 
-        $percent = $this->collectionFeePercent[$asked->currency] ?? $this->collectionFeePercent['*'] ?? null;
-        if ($percent === null || !is_numeric($percent) || (float) $percent <= 0) {
+        $found = $this->fees()->rule(FeeSchedule::COLLECTION, $payment->market()->country, $network);
+        $fee   = $reported->minor - $asked->minor;
+
+        return $found !== null && $found['rule']->accepts($asked, $fee) ? Money::ofMinor($fee, $asked->currency) : null;
+    }
+
+    /**
+     * The network that carried a payment, as the fee schedule names it: "card"
+     * for a card payment, else what MarzPay reports as `provider` (mtn,
+     * airtel, mpesa, …).
+     *
+     * @param array<string, mixed> $detail      the collection / disbursement / withdrawal object
+     * @param array<string, mixed> $transaction
+     */
+    private static function network(Payment $payment, array $detail, array $transaction): ?string
+    {
+        if ($payment->method() === PaymentMethod::Card) {
+            return 'card';
+        }
+        $provider = self::str($detail['provider'] ?? null) ?? self::str($transaction['provider'] ?? null);
+        $network  = $provider !== null ? FeeSchedule::network($provider) : '';
+
+        return $network !== '' ? mb_substr($network, 0, 30) : null;
+    }
+
+    /**
+     * A money object MarzPay reports for a charge — null when absent, in
+     * another currency, negative or unreadable. A fee is never a reason to
+     * fail a status lookup.
+     */
+    private static function charge(mixed $value, string $currency): ?Money
+    {
+        if (!\is_array($value) || !isset($value['raw']) || strtoupper((string) ($value['currency'] ?? $currency)) !== $currency) {
             return null;
         }
 
-        // Basis points, so the arithmetic stays in integers.
-        $bps   = (int) round((float) $percent * 100);
-        $exact = $asked->minor * $bps;                 // fee × 10,000, in minor units
-        $floor = intdiv($exact, 10_000);
-        $ceil  = $floor + ($exact % 10_000 === 0 ? 0 : 1);
-        $unit  = 10 ** Money::exponentOf($asked->currency);
-
-        $fee = $reported->minor - $asked->minor;
-        $explained = $fee >= $floor - 1 && $fee <= $ceil + 1
-            || $fee === intdiv($floor, $unit) * $unit                       // rounded down to a whole unit
-            || $fee === intdiv($ceil + $unit - 1, $unit) * $unit;           // rounded up to a whole unit
-
-        return $explained ? Money::ofMinor($fee, $asked->currency) : null;
+        try {
+            return Money::ofMajor(
+                \is_int($value['raw']) || \is_float($value['raw']) ? $value['raw'] : (string) $value['raw'],
+                $currency,
+            );
+        } catch (\DomainException) {
+            return null;
+        }
     }
 
     /**

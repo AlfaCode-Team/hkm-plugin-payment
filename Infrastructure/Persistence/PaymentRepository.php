@@ -37,7 +37,8 @@ final class PaymentRepository implements PaymentStore
         country, phone_number, description, subject_type, subject_id, exclusive_key, metadata, metadata_pii,
         provider_uuid, provider_reference, provider_transaction_id, redirect_url, failure_code, failure_message,
         initiated_by, created_at, settled_at, last_checked_at, notified_at, notify_attempts,
-        bank_name, bank_account_number, bank_account_name, bank_branch';
+        bank_name, bank_account_number, bank_account_name, bank_branch, network, fee_minor, fee_paid_by, reviewed_by, reviewed_at,
+        owner_type, owner_id, phone_number_id, flag_reason, flagged_at';
 
     public function __construct(
         private readonly DatabasePort $db,
@@ -76,7 +77,8 @@ final class PaymentRepository implements PaymentStore
         $set = [
             'status', 'previous_status', 'exclusive_key', 'provider_uuid', 'provider_reference',
             'provider_transaction_id', 'redirect_url', 'failure_code', 'failure_message', 'settled_at',
-            'last_checked_at', 'notified_at', 'notify_attempts', 'updated_at',
+            'last_checked_at', 'notified_at', 'notify_attempts', 'updated_at', 'network', 'fee_minor', 'fee_paid_by', 'reviewed_by', 'reviewed_at',
+            'owner_type', 'owner_id', 'phone_number_id', 'flag_reason', 'flagged_at',
         ];
 
         $params = ['reference' => $row['reference'], 'expected' => $expected->value];
@@ -98,6 +100,25 @@ final class PaymentRepository implements PaymentStore
                 context:  ['reference' => (string) $payment->reference()],
                 previous: $e,
             );
+        }
+    }
+
+    public function markNotified(Payment $payment, PaymentStatus $status): bool
+    {
+        try {
+            return $this->db->execute(
+                "UPDATE {$this->table} SET notified_at = :notified_at, notify_attempts = :attempts, updated_at = :updated_at
+                 WHERE reference = :reference AND status = :status",
+                [
+                    'notified_at' => $payment->notifiedAt() !== null ? self::ts($payment->notifiedAt()) : null,
+                    'attempts'    => $payment->notifyAttempts(),
+                    'updated_at'  => self::ts($this->clock?->now() ?? new \DateTimeImmutable()),
+                    'reference'   => $payment->reference()->value,
+                    'status'      => $status->value,
+                ],
+            ) > 0;
+        } catch (\PDOException $e) {
+            throw new RepositoryException('Failed to record an announcement', layer: 'repository.payment', previous: $e);
         }
     }
 
@@ -128,9 +149,11 @@ final class PaymentRepository implements PaymentStore
     public function awaitingNotification(\DateTimeImmutable $settledBefore, int $maxAttempts, int $limit): array
     {
         return $this->many(
-            'status <> :pending AND notified_at IS NULL AND settled_at < :before AND notify_attempts < :max',
+            // A withdrawal waiting for approval has no settled_at — it is announced
+            // (payout.requested) from the moment it was created.
+            'status <> :pending AND notified_at IS NULL AND COALESCE(settled_at, created_at) < :before AND notify_attempts < :max',
             ['pending' => PaymentStatus::Pending->value, 'before' => self::ts($settledBefore), 'max' => $maxAttempts],
-            'settled_at ASC',
+            'COALESCE(settled_at, created_at) ASC',
             $limit,
         );
     }
@@ -141,11 +164,13 @@ final class PaymentRepository implements PaymentStore
             $row = $this->db->queryOne(
                 "SELECT COALESCE(SUM(amount_minor), 0) AS total FROM {$this->table}
                  WHERE direction = :direction AND currency = :currency AND created_at >= :since
-                   AND status IN (:pending, :succeeded)",
+                   AND status IN (:requested, :pending, :succeeded)",
                 [
                     'direction' => PaymentDirection::Payout->value,
                     'currency'  => $currency,
                     'since'     => self::ts($since),
+                    // A withdrawal waiting for approval is money already promised.
+                    'requested' => PaymentStatus::Requested->value,
                     'pending'   => PaymentStatus::Pending->value,
                     'succeeded' => PaymentStatus::Succeeded->value,
                 ],
@@ -177,6 +202,14 @@ final class PaymentRepository implements PaymentStore
                 $where[]         = "{$column} = :{$column}";
                 $params[$column] = $value;
             }
+        }
+        if ($query->flagged !== null) {
+            $where[] = $query->flagged ? 'flag_reason IS NOT NULL' : 'flag_reason IS NULL';
+        }
+        if ($query->ownerType !== null && $query->ownerId !== null) {
+            $where[]             = 'owner_type = :owner_type AND owner_id = :owner_id';
+            $params['owner_type'] = $query->ownerType;
+            $params['owner_id']   = $query->ownerId;
         }
         if ($query->from !== null) {
             $where[]        = 'created_at >= :from';
@@ -327,6 +360,16 @@ final class PaymentRepository implements PaymentStore
             'bank_account_number'     => $p->bankAccount()?->accountNumber,
             'bank_account_name'       => $p->bankAccount()?->accountName,
             'bank_branch'             => $p->bankAccount()?->branch,
+            'network'                 => $p->network(),
+            'fee_minor'               => $p->fee()?->minor,
+            'fee_paid_by'             => $p->feePaidBy(),
+            'reviewed_by'             => $p->reviewedBy(),
+            'reviewed_at'             => $p->reviewedAt() !== null ? self::ts($p->reviewedAt()) : null,
+            'owner_type'              => $p->ownerType(),
+            'owner_id'                => $p->ownerId(),
+            'phone_number_id'         => $p->phoneNumberId(),
+            'flag_reason'             => $p->flagReason(),
+            'flagged_at'              => $p->flaggedAt() !== null ? self::ts($p->flaggedAt()) : null,
         ];
     }
 
@@ -372,6 +415,16 @@ final class PaymentRepository implements PaymentStore
                     self::nullable($row['bank_branch'] ?? null),
                 )
                 : null,
+            network:               self::nullable($row['network'] ?? null),
+            fee:                   isset($row['fee_minor']) && $row['fee_minor'] !== '' ? Money::ofMinor((int) $row['fee_minor'], (string) $row['currency']) : null,
+            feePaidBy:             self::nullable($row['fee_paid_by'] ?? null),
+            reviewedBy:            self::nullable($row['reviewed_by'] ?? null),
+            reviewedAt:            self::date($row['reviewed_at'] ?? null),
+            flagReason:            self::nullable($row['flag_reason'] ?? null),
+            flaggedAt:             self::date($row['flagged_at'] ?? null),
+            ownerType:             self::nullable($row['owner_type'] ?? null),
+            ownerId:               self::nullable($row['owner_id'] ?? null),
+            phoneNumberId:         self::nullable($row['phone_number_id'] ?? null),
         );
     }
 

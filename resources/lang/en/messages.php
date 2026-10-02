@@ -38,6 +38,14 @@ return [
     'phone_failed'         => 'This phone number could not be verified, so money cannot be sent to it.',
     'phone_limit'          => 'At most :max phone numbers can be saved. Remove one first.',
     'lookup_limit'         => 'Too many phone number checks today. Try again tomorrow.',
+    'not_awaiting_approval' => 'This withdrawal is not waiting for approval (it is :status).',
+    'approver_required'    => 'A signed-in administrator must approve withdrawals.',
+    'own_withdrawal'       => 'You cannot approve or reject your own withdrawal.',
+    'approval_required'    => 'Money out must be approved by an administrator — use withdraw(), payout() or transfer().',
+    'requester_required'   => 'Sign in to request a withdrawal.',
+    'payout_minimum'       => 'The smallest amount that can be sent is :minimum :currency.',
+    'payout_currency'      => 'Payouts in :currency are not enabled.',
+    'phone_name_mismatch'  => 'This phone number is registered to someone else.',
     'bank_transfer_unavailable' => 'Bank transfers are not available in :country.',
 
     'validation' => [

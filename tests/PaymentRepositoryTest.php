@@ -129,6 +129,90 @@ final class PaymentRepositoryTest extends TestCase
         self::assertSame(100000, $this->repository->payoutTotalSince('UGX', $this->clock->now()->modify('-1 hour')), 'counted with the payouts');
     }
 
+    public function test_the_fee_and_network_round_trip_and_survive_a_status_update(): void
+    {
+        $payment = $this->payment();
+        $this->repository->insert($payment);
+        self::assertNull($this->repository->find($payment->reference())?->fee(), 'unknown until the provider names it');
+
+        $payment->observedNetwork('airtel');
+        $payment->recordFee(Money::ofMajor(150, 'UGX'), Payment::FEE_PAID_BY_CUSTOMER);
+        $payment->settle(PaymentStatus::Succeeded, $this->clock->now());
+        self::assertTrue($this->repository->update($payment, PaymentStatus::Pending));
+
+        $loaded = $this->repository->find($payment->reference());
+        self::assertSame('airtel', $loaded?->network());
+        self::assertEquals(Money::ofMajor(150, 'UGX'), $loaded?->fee());
+        self::assertSame('customer', $loaded?->feePaidBy());
+        self::assertEquals(Money::ofMajor(5000, 'UGX'), $loaded?->walletEffect());
+    }
+
+    public function test_a_withdrawal_request_is_announced_counted_and_its_reviewer_kept(): void
+    {
+        $market  = Market::of('UG');
+        $request = Payment::initiate(
+            PaymentDirection::Payout, PaymentMethod::MobileMoney, 'marzpay', $market, Money::ofMajor(70000, 'UGX'),
+            PhoneNumber::forMarket('+256712345678', $market), null, 'wallet.withdrawal', 'W-9', [], 'user-42',
+            $this->clock->now(), [], true, null, true,
+        );
+        $this->repository->insert($request);
+
+        self::assertSame(PaymentStatus::Requested, $this->repository->find($request->reference())?->status());
+        self::assertSame(70000, $this->repository->payoutTotalSince('UGX', $this->clock->now()->modify('-1 hour')), 'promised money counts');
+        $this->clock->advance(60);
+        self::assertCount(1, $this->repository->awaitingNotification($this->clock->now(), 10, 10), 'payout.requested is in the outbox');
+
+        $request->approve('admin-1', $this->clock->now());
+        self::assertTrue($this->repository->update($request, PaymentStatus::Requested));
+        self::assertFalse($this->repository->update($request, PaymentStatus::Requested), 'a second approval loses the compare-and-set');
+
+        $loaded = $this->repository->find($request->reference());
+        self::assertSame(PaymentStatus::Pending, $loaded?->status());
+        self::assertSame('admin-1', $loaded?->reviewedBy());
+        self::assertEquals($this->clock->now(), $loaded?->reviewedAt());
+    }
+
+    public function test_mark_notified_writes_only_the_announcement_and_only_at_that_status(): void
+    {
+        $payment = $this->payment();
+        $this->repository->insert($payment);
+
+        // Another process records a fee and a flag on the stored row…
+        $other = $this->repository->find($payment->reference());
+        $other?->recordFee(Money::ofMajor(100, 'UGX'), Payment::FEE_PAID_BY_BUSINESS);
+        $other?->flag('fee check', $this->clock->now());
+        self::assertTrue($this->repository->update($other, PaymentStatus::Pending));
+
+        // …while this process, holding an older copy, records its announcement.
+        $payment->notified($this->clock->now());
+        self::assertTrue($this->repository->markNotified($payment, PaymentStatus::Pending));
+
+        $stored = $this->repository->find($payment->reference());
+        self::assertNotNull($stored?->notifiedAt());
+        self::assertEquals(Money::ofMajor(100, 'UGX'), $stored?->fee(), 'the other write survives');
+        self::assertSame('fee check', $stored?->flagReason());
+
+        self::assertFalse($this->repository->markNotified($payment, PaymentStatus::Succeeded), 'guarded by status');
+    }
+
+    public function test_flags_and_owners_round_trip_and_filter(): void
+    {
+        $flagged = $this->payment();
+        $flagged->flag('amount short', $this->clock->now());
+        $flagged->forOwner('user', '42', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+        $this->repository->insert($flagged);
+        $this->repository->insert($this->payment());
+
+        $loaded = $this->repository->find($flagged->reference());
+        self::assertSame('amount short', $loaded?->flagReason());
+        self::assertTrue($loaded?->belongsTo('user', '42'));
+        self::assertSame('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', $loaded?->phoneNumberId());
+
+        self::assertSame(1, $this->repository->search(new PaymentQuery(flagged: true))['total']);
+        self::assertSame(1, $this->repository->search(new PaymentQuery(flagged: false))['total']);
+        self::assertSame(1, $this->repository->search(new PaymentQuery(ownerType: 'user', ownerId: '42'))['total']);
+    }
+
     public function test_a_payment_round_trips(): void
     {
         $payment = $this->payment();

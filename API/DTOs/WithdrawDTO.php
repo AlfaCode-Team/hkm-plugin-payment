@@ -43,6 +43,14 @@ final readonly class WithdrawDTO
         public ?string $callbackBaseUrl = null,
         public bool $exclusive = true,
         public array $piiMetadataKeys = [],
+        /**
+         * Since 1.2.0: the name the money should reach (the account holder's
+         * name in your application). When the saved number has a registered
+         * name, it must match (order, case, accents and a middle name ignored)
+         * or the withdrawal is refused — a number that changed hands, or that
+         * was never theirs, is caught before money leaves.
+         */
+        public ?string $expectedName = null,
     ) {
     }
 

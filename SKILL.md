@@ -32,6 +32,7 @@ Complete reference for integrating **all MarzPay merchant API products**, includ
 Always send `country` on money-movement requests. For DRC, also send `currency` (`CDF` default or `USD`). Bills, bank transfer, card, and airtime are Uganda-primary today; other markets use the same collect/send endpoints with the matching country code.
 
 - **Docs:** https://wallet.wearemarz.com/documentation (Kenya: `https://wallet.wearemarz.com/documentation/kenya` · Rwanda: `https://wallet.wearemarz.com/documentation/rwanda` · DRC: `https://wallet.wearemarz.com/documentation/drc` · Zambia: `https://wallet.wearemarz.com/documentation/zambia` · Cameroon: `https://wallet.wearemarz.com/documentation/cameroon` · West Africa: `https://wallet.wearemarz.com/documentation/west-africa` · Benin: `https://wallet.wearemarz.com/documentation/benin` · Côte d'Ivoire: `https://wallet.wearemarz.com/documentation/cote-divoire` · Gabon: `https://wallet.wearemarz.com/documentation/gabon` · Congo-Brazzaville: `https://wallet.wearemarz.com/documentation/congo-brazzaville` · Senegal: `https://wallet.wearemarz.com/documentation/senegal` · Sierra Leone: `https://wallet.wearemarz.com/documentation/sierra-leone`)
+- **Published pricing:** https://wallet.wearemarz.com/pricing — do not hardcode fees; read current rates from the public pricing page.
 - **API base:** `https://wallet.wearemarz.com/api/v1`
 - **Auth:** HTTP Basic — `Authorization: Basic base64(api_key:api_secret)`
 - **Content-Type:** `application/json` (form-data also accepted on some collection endpoints)
@@ -466,7 +467,7 @@ POST /bank-transfer/validate
 }
 ```
 
-- You pay **amount + tiered charge**; recipient receives `amount`
+- You pay **amount + charge**; recipient receives `amount`
 - Balance debited immediately; refunded on failure
 - Poll `GET /bank-transfer/{reference}` — show response may use key `bank_transfer_request` (name differs from create)
 - Statuses: `processing` → `completed` or `failed`
@@ -1036,6 +1037,8 @@ Registered webhooks wrap the payload:
     "reference": "c97fae8b-9b7f-4192-9f72-6f0859d33e67",
     "status": "completed",
     "amount": { "formatted": "10,000.00", "raw": 10000, "currency": "UGX" },
+    "charge": { "formatted": "350.00", "raw": 350, "currency": "UGX" },
+    "net_amount": { "formatted": "9,650.00", "raw": 9650, "currency": "UGX" },
     "provider": "mtn",
     "phone_number": "+256712345678",
     "description": "Order #1042",
@@ -1046,6 +1049,8 @@ Registered webhooks wrap the payload:
     "provider": "mtn",
     "phone_number": "+256712345678",
     "amount": { "formatted": "10,000.00", "raw": 10000, "currency": "UGX" },
+    "charge": { "formatted": "350.00", "raw": 350, "currency": "UGX" },
+    "net_amount": { "formatted": "9,650.00", "raw": 9650, "currency": "UGX" },
     "mode": "mtnuganda",
     "provider_transaction_id": "148769164724"
   },
@@ -1058,7 +1063,8 @@ Registered webhooks wrap the payload:
 
 Kenya collection: `provider` is `mpesa`, currency `KES`, phone `+254…`.  
 Failed: `event_type` = `collection.failed`, `transaction.status` = `failed`.  
-**There is no `provider_reference` on collection callbacks** — use `collection.provider_transaction_id`.
+**There is no `provider_reference` on collection callbacks** — use `collection.provider_transaction_id`.  
+`amount` is the collected total (what the customer paid). `charge` is the MarzPay fee. `net_amount` is `amount − charge` (what is credited to the merchant wallet). Both fields are added next to `amount`; do not replace `amount`.
 
 ### Disbursement callback (direct)
 

@@ -30,6 +30,11 @@ final readonly class PaymentQuery
          * provider's reference or uuid (exact), or part of a phone number.
          */
         public ?string $search = null,
+        /** Since 1.2.0: true = only payments an admin must check with the provider; false = none of them. */
+        public ?bool $flagged = null,
+        /** Since 1.2.0: only one owner's withdrawals (both or neither). */
+        public ?string $ownerType = null,
+        public ?string $ownerId = null,
     ) {
         $this->page    = max(1, $page);
         $this->perPage = max(1, min(self::MAX_PER_PAGE, $perPage));
@@ -68,6 +73,9 @@ final readonly class PaymentQuery
             page:        (int) ($input['page'] ?? 1),
             perPage:     (int) ($input['per_page'] ?? 25),
             search:      $str($input['search'] ?? $input['q'] ?? null),
+            flagged:     isset($input['flagged']) && $str($input['flagged']) !== null
+                ? \in_array(strtolower((string) $input['flagged']), ['1', 'true', 'yes', 'on'], true)
+                : null,
         );
     }
 

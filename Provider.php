@@ -21,7 +21,10 @@ use AlfacodeTeam\PhpServicePlatform\Kernel\Ports\SystemClock;
 use AlfacodeTeam\PhpServicePlatform\Kernel\Security\Identity;
 use Plugins\Payment\API\Contracts\MarzPayServiceContract;
 use Plugins\Payment\API\Contracts\PaymentActivityContract;
+use Plugins\Payment\API\Contracts\PaymentFeesContract;
+use Plugins\Payment\API\Contracts\PaymentReviewContract;
 use Plugins\Payment\API\Contracts\PaymentServiceContract;
+use Plugins\Payment\API\Contracts\WithdrawalApprovalContract;
 use Plugins\Payment\API\Contracts\PhoneNumberServiceContract;
 use Plugins\Payment\Application\Gateway\GatewayRegistry;
 use Plugins\Payment\Application\Services\MarzPayService;
@@ -32,6 +35,7 @@ use Plugins\Payment\Domain\ValueObjects\Money;
 use Plugins\Payment\Infrastructure\Cli\ReconcilePaymentsCommand;
 use Plugins\Payment\Infrastructure\Gateways\MarzPay\MarzPayClient;
 use Plugins\Payment\Infrastructure\Gateways\MarzPay\MarzPayGateway;
+use Plugins\Payment\Infrastructure\Gateways\MarzPay\MarzPayPricing;
 use Plugins\Payment\Infrastructure\Http\Stages\StatusRateLimitStage;
 use Plugins\Payment\Infrastructure\Persistence\PaymentJournalRepository;
 use Plugins\Payment\Infrastructure\Persistence\PaymentRepository;
@@ -74,7 +78,7 @@ final class Provider implements ModuleContract
     /** @return list<class-string> */
     public function exposes(): array
     {
-        return [PaymentServiceContract::class, PhoneNumberServiceContract::class, MarzPayServiceContract::class, PaymentActivityContract::class];
+        return [PaymentServiceContract::class, PaymentFeesContract::class, WithdrawalApprovalContract::class, PaymentReviewContract::class, PhoneNumberServiceContract::class, MarzPayServiceContract::class, PaymentActivityContract::class];
     }
 
     public function register(ModuleContainer $container): void
@@ -94,7 +98,10 @@ final class Provider implements ModuleContract
                 self::clock($c),
                 webhookSecret: self::env('MARZPAY_WEBHOOK_SECRET'),
                 checkoutHosts: self::checkoutHosts(),
-                collectionFeePercent: self::collectionFees(),
+                fees:          MarzPayPricing::withAccountRates(
+                    // Unset → our agreed 2%; set EMPTY → MarzPay's published rates only.
+                    self::env('MARZPAY_COLLECTION_FEE_PERCENT', MarzPayPricing::ACCOUNT_COLLECTION_DEFAULT, allowEmpty: true),
+                ),
             ));
 
         $container->bindInternal(GatewayRegistry::class, static fn(ModuleContainer $c) =>
@@ -106,6 +113,18 @@ final class Provider implements ModuleContract
         // The REQUEST's DatabasePort: the tenant database on a Tenancy host,
         // the central one otherwise. See PaymentRepository for why.
         $container->bind(PaymentServiceContract::class, static fn(ModuleContainer $c) =>
+            self::paymentService($c, $c->make(DatabasePort::class), static fn(string $id): mixed => $c->make($id)));
+
+        // Admins clearing payments flagged for a check with the provider.
+        $container->bind(PaymentReviewContract::class, static fn(ModuleContainer $c) =>
+            self::paymentService($c, $c->make(DatabasePort::class), static fn(string $id): mixed => $c->make($id)));
+
+        // Admins deciding on withdrawals that wait (PAYMENT_WITHDRAW_APPROVAL=admin).
+        $container->bind(WithdrawalApprovalContract::class, static fn(ModuleContainer $c) =>
+            self::paymentService($c, $c->make(DatabasePort::class), static fn(string $id): mixed => $c->make($id)));
+
+        // Fee quotes. quote() is arithmetic over the fee schedule; it runs no query.
+        $container->bind(PaymentFeesContract::class, static fn(ModuleContainer $c) =>
             self::paymentService($c, $c->make(DatabasePort::class), static fn(string $id): mixed => $c->make($id)));
 
         // Read-only operator view: each payment's history and every callback
@@ -129,7 +148,10 @@ final class Provider implements ModuleContract
             new MarzPayService(
                 $c->make(MarzPayClient::class),
                 self::identity($c),
-                adminPermission: self::env('PAYMENT_ADMIN_PERMISSION', 'payment:manage', allowEmpty: true),
+                adminPermission:  self::env('PAYMENT_ADMIN_PERMISSION', 'payment:manage', allowEmpty: true),
+                payoutPermission: self::env('PAYMENT_PAYOUT_PERMISSION', 'payment:payout', allowEmpty: true),
+                withdrawApproval: strtolower(self::env('PAYMENT_WITHDRAW_APPROVAL', PaymentService::WITHDRAW_SELF)),
+                payoutMaxMinor:   self::limits('PAYMENT_PAYOUT_MAX'),
             ));
     }
 
@@ -239,6 +261,14 @@ final class Provider implements ModuleContract
             notifyMaxAttempts:   max(1, (int) self::env('PAYMENT_NOTIFY_MAX_ATTEMPTS', '10')),
             phones:              new PhoneNumberRepository($db, $clock),
             withdrawRequiresVerified: self::bool('PAYMENT_WITHDRAW_REQUIRE_VERIFIED', true),
+            // 'self' (sent at once) | 'admin' (waits for approval). Anything else
+            // fails closed in the constructor: a typo must not quietly mean "self".
+            withdrawApproval:    strtolower(self::env('PAYMENT_WITHDRAW_APPROVAL', PaymentService::WITHDRAW_SELF)),
+            approverPermission:  self::env('PAYMENT_WITHDRAW_APPROVER_PERMISSION', 'payment:approve', allowEmpty: true),
+            collectionMismatch:  strtolower(self::env('PAYMENT_COLLECTION_MISMATCH', PaymentService::MISMATCH_DELIVER)),
+            payoutMinMinor:      self::limits('PAYMENT_PAYOUT_MIN'),
+            approvalAboveMinor:  self::limits('PAYMENT_APPROVAL_ABOVE'),
+            verificationMaxAgeDays: max(0, (int) self::env('PAYMENT_PHONE_VERIFICATION_MAX_AGE_DAYS', '0')),
             journal:             new PaymentJournalRepository($db, $clock),
         );
     }
@@ -312,27 +342,6 @@ final class Provider implements ModuleContract
     }
 
     /** @return list<string> the API host plus MARZPAY_CHECKOUT_HOSTS */
-    /**
-     * MARZPAY_COLLECTION_FEE_PERCENT — "UGX:3,*:4": MarzPay's charge on a
-     * collection per currency, '*' for every other. A malformed entry is
-     * skipped; an unset or empty value keeps the documented default.
-     *
-     * @return array<string,string>
-     */
-    private static function collectionFees(): array
-    {
-        $fees = [];
-        foreach (explode(',', self::env('MARZPAY_COLLECTION_FEE_PERCENT')) as $pair) {
-            [$currency, $percent] = array_map('trim', explode(':', $pair, 2)) + [1 => ''];
-            $currency = strtoupper($currency);
-            if (($currency === '*' || preg_match('/^[A-Z]{3}$/', $currency) === 1) && is_numeric($percent) && (float) $percent >= 0 && (float) $percent < 50) {
-                $fees[$currency] = $percent;
-            }
-        }
-
-        return $fees === [] ? MarzPayGateway::COLLECTION_FEE_PERCENT : $fees;
-    }
-
     private static function checkoutHosts(): array
     {
         $hosts = [strtolower((string) parse_url(self::marzPayBase(), PHP_URL_HOST))];
