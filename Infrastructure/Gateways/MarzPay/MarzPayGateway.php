@@ -149,8 +149,9 @@ final class MarzPayGateway implements PaymentGateway, PhoneVerificationGateway, 
 
         $isPayout = $payment->direction() === PaymentDirection::Payout;
         $detail   = self::arr($payload[$isPayout ? 'disbursement' : 'collection'] ?? null);
-        $status   = self::mapStatus(
-            self::str($transaction['status'] ?? null) ?? self::eventOutcome(self::str($payload['event_type'] ?? null)),
+        $status   = self::lookupStatus(
+            self::str($transaction['status'] ?? null),
+            self::str($payload['event_type'] ?? null),
         );
 
         return new GatewayResult(
@@ -160,8 +161,12 @@ final class MarzPayGateway implements PaymentGateway, PhoneVerificationGateway, 
             providerReference:     $isPayout ? self::str($transaction['reference'] ?? null) : null,
             providerTransactionId: self::str($detail['provider_transaction_id'] ?? null),
             amount:                self::money($transaction['amount'] ?? null),
+            // The provider's own word when it is the one that decided, else
+            // the outcome the event named ("marzpay.failed", not ".processing").
             failureCode:           $status->isFinal() && $status !== PaymentStatus::Succeeded
-                ? 'marzpay.' . (self::str($transaction['status'] ?? null) ?? $status->value)
+                ? 'marzpay.' . (self::mapStatus(self::str($transaction['status'] ?? null))->isFinal()
+                    ? (string) self::str($transaction['status'] ?? null)
+                    : $status->value)
                 : null,
         );
     }
@@ -460,6 +465,30 @@ final class MarzPayGateway implements PaymentGateway, PhoneVerificationGateway, 
             // not final. An unknown word must never read as money received.
             default                                                              => PaymentStatus::Pending,
         };
+    }
+
+    /**
+     * The status a transaction lookup reports. Both of its fields are MarzPay's
+     * own answer to our authenticated request, and `event_type` names the
+     * outcome outright: `collection.completed` means the money was received.
+     * So a FINAL event outranks a transaction status that is not final yet
+     * (`pending`, `processing`, or a word not mapped here). A final transaction
+     * status is kept as it is — the two disagreeing on the outcome itself
+     * (completed vs failed) is not resolved by picking the friendlier one.
+     *
+     * Only the lookup is read this way, never the callback body: a callback is
+     * unauthenticated unless signed, and is only ever a cue to look up.
+     */
+    private static function lookupStatus(?string $transactionStatus, ?string $eventType): PaymentStatus
+    {
+        $fromStatus = self::mapStatus($transactionStatus);
+        if ($fromStatus->isFinal()) {
+            return $fromStatus;
+        }
+
+        $fromEvent = self::mapStatus(self::eventOutcome($eventType));
+
+        return $fromEvent->isFinal() ? $fromEvent : $fromStatus;
     }
 
     /**

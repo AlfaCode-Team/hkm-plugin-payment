@@ -6,6 +6,18 @@ All notable changes to this plugin are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-10-02
+
+### Fixed
+
+- A MarzPay status lookup whose `event_type` is `collection.completed` now
+  settles the payment as succeeded even while `transaction.status` still reads
+  `pending`/`processing` (or an unmapped word): MarzPay's event names the
+  outcome, and it is its own answer to an authenticated lookup. Likewise
+  `*.failed` fails it, with `marzpay.failed` as the failure code. A final
+  `transaction.status` is never overruled by the event, and an unsigned
+  callback body still settles nothing on its own.
+
 ## [1.1.0] - 2026-09-28
 
 ### Added

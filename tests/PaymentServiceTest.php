@@ -313,6 +313,44 @@ final class PaymentServiceTest extends TestCase
         self::assertSame([], $this->listener->events);
     }
 
+    public function test_a_lookup_reporting_collection_completed_is_money_received_even_while_its_status_lags(): void
+    {
+        $service = $this->service();
+        $payment = $this->collect($service);
+        // MarzPay's own answer names the outcome in event_type; the transaction's
+        // status word has not caught up yet.
+        $this->http->on('GET', '/transactions/' . self::UUID, 200, F::collectionEvent($payment->reference, self::UUID, 'collection.completed', 'processing'));
+
+        $this->webhook($service, F::collectionCallback($payment->reference, self::UUID));
+
+        self::assertSame(PaymentStatus::Succeeded, $this->store->only()->status());
+        self::assertSame(['payment.succeeded'], $this->listener->names());
+    }
+
+    public function test_a_final_transaction_status_is_not_overruled_by_the_event(): void
+    {
+        $service = $this->service();
+        $payment = $this->collect($service);
+        $this->http->on('GET', '/transactions/' . self::UUID, 200, F::collectionEvent($payment->reference, self::UUID, 'collection.completed', 'failed'));
+
+        $this->webhook($service, F::collectionCallback($payment->reference, self::UUID));
+
+        self::assertSame(PaymentStatus::Failed, $this->store->only()->status(), 'completed vs failed is a contradiction, not a success');
+    }
+
+    public function test_a_lookup_reporting_collection_failed_fails_it_with_the_outcome_as_its_code(): void
+    {
+        $service = $this->service();
+        $payment = $this->collect($service);
+        $this->http->on('GET', '/transactions/' . self::UUID, 200, F::collectionEvent($payment->reference, self::UUID, 'collection.failed', 'processing'));
+
+        $this->webhook($service, F::collectionCallback($payment->reference, self::UUID, 'failed'));
+
+        $row = $this->store->only();
+        self::assertSame(PaymentStatus::Failed, $row->status());
+        self::assertSame('marzpay.failed', $row->failureCode());
+    }
+
     public function test_a_callback_naming_another_transaction_is_checked_against_the_stored_uuid(): void
     {
         $service = $this->service();
