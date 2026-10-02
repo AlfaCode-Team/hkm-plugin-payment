@@ -45,6 +45,7 @@ Requires the `database.management` and `http.client` plugins, and kernel `^1.13.
 | `MARZPAY_API_BASE` | `https://wallet.wearemarz.com/api/v1` | |
 | `MARZPAY_WEBHOOK_SECRET` | *(unset)* | When set, every callback must carry a valid `X-MarzPay-Signature`. Set it in production if your account supports signing. |
 | `MARZPAY_TIMEOUT` | `60` | Seconds per MarzPay call. |
+| `MARZPAY_COLLECTION_FEE_PERCENT` | `UGX:3,*:4` | MarzPay's own charge on a collection, percent per currency (`*` = every other). A status lookup may report the amount asked PLUS this fee (5,047.00 CDF asked → 5,248.88); such a payment is settled and its history notes the fee. Any other difference is still refused. |
 | `MARZPAY_CHECKOUT_HOSTS` | *(unset)* | Extra hosts a card `redirect_url` may point at. The API host is always allowed. |
 | `PAYMENT_DEFAULT_PROVIDER` / `PAYMENT_DEFAULT_COUNTRY` | `marzpay` / `UG` | |
 | `PAYMENT_CALLBACK_BASE_URL` | *(unset)* | `https://pay.example.com` — forces one host for all callbacks. |

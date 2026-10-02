@@ -366,6 +366,42 @@ final class PaymentServiceTest extends TestCase
         self::assertSame(PaymentStatus::Pending, $this->store->only()->status());
     }
 
+    public function test_a_cdf_amount_reported_with_marzpays_4_percent_fee_is_settled(): void
+    {
+        $service = $this->service();
+        // 5,047.00 CDF asked; MarzPay reports 5,248.88 — the same plus its 4%.
+        $payment = $this->collect($service, ['amount' => '5047.00', 'phoneNumber' => '+243812345678', 'country' => 'CD', 'currency' => 'CDF']);
+        $this->http->on('GET', '/transactions/' . self::UUID, 200, F::collectionCallback($payment->reference, self::UUID, 'completed', 5248.88, 'CDF'));
+
+        $this->webhook($service, F::collectionCallback($payment->reference, self::UUID));
+
+        self::assertSame(PaymentStatus::Succeeded, $this->store->only()->status());
+        self::assertSame(['payment.succeeded'], $this->listener->names());
+    }
+
+    public function test_a_ugx_amount_reported_with_marzpays_3_percent_fee_is_settled(): void
+    {
+        $service = $this->service();
+        $payment = $this->collect($service);   // 5,000 UGX
+        $this->http->on('GET', '/transactions/' . self::UUID, 200, F::collectionCallback($payment->reference, self::UUID, 'completed', 5150));
+
+        $this->webhook($service, F::collectionCallback($payment->reference, self::UUID));
+
+        self::assertSame(PaymentStatus::Succeeded, $this->store->only()->status());
+    }
+
+    public function test_a_surplus_that_is_not_marzpays_fee_is_not_settled(): void
+    {
+        $service = $this->service();
+        $payment = $this->collect($service);   // 5,000 UGX: the fee is 3%, so 5,200 is unexplained
+        $this->http->on('GET', '/transactions/' . self::UUID, 200, F::collectionCallback($payment->reference, self::UUID, 'completed', 5200));
+
+        $this->webhook($service, F::collectionCallback($payment->reference, self::UUID));
+
+        self::assertSame(PaymentStatus::Pending, $this->store->only()->status());
+        self::assertSame([], $this->listener->events);
+    }
+
     public function test_a_confirmed_amount_that_differs_is_not_settled(): void
     {
         $service = $this->service();

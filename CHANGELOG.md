@@ -6,6 +6,24 @@ All notable changes to this plugin are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-10-02
+
+### Fixed
+
+- A collection MarzPay reports with its own fee on top is now settled. The
+  status lookup may report the GROSS — 5,047.00 CDF asked comes back as
+  5,248.88 (its 4%), 5,000 UGX as 5,150 (its 3%) — and those payments stayed
+  pending as "amount differs". The gateway now names the fee
+  (`GatewayResult::$providerFee`) when the surplus matches MarzPay's schedule,
+  the service settles when `amount - fee` is exactly what was asked, and the
+  history records `check.fee_included`. Any other surplus or shortfall is still
+  refused.
+
+### Added
+
+- `MARZPAY_COLLECTION_FEE_PERCENT` (default `UGX:3,*:4`) and
+  `Money::exponentOf()`.
+
 ## [1.1.1] - 2026-10-02
 
 ### Fixed

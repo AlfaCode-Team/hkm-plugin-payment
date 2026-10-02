@@ -1,6 +1,6 @@
 {
     "name": "payment",
-    "version": "1.1.1",
+    "version": "1.1.2",
     "kernel": "^1.13.1",
     "solves": "payment.processing",
     "type": "module",
@@ -147,6 +147,12 @@
             "type": "bool",
             "required": false,
             "default": false
+        },
+        {
+            "key": "MARZPAY_COLLECTION_FEE_PERCENT",
+            "type": "string",
+            "required": false,
+            "default": "UGX:3,*:4"
         },
         {
             "key": "MARZPAY_CHECKOUT_HOSTS",

@@ -94,6 +94,7 @@ final class Provider implements ModuleContract
                 self::clock($c),
                 webhookSecret: self::env('MARZPAY_WEBHOOK_SECRET'),
                 checkoutHosts: self::checkoutHosts(),
+                collectionFeePercent: self::collectionFees(),
             ));
 
         $container->bindInternal(GatewayRegistry::class, static fn(ModuleContainer $c) =>
@@ -311,6 +312,27 @@ final class Provider implements ModuleContract
     }
 
     /** @return list<string> the API host plus MARZPAY_CHECKOUT_HOSTS */
+    /**
+     * MARZPAY_COLLECTION_FEE_PERCENT — "UGX:3,*:4": MarzPay's charge on a
+     * collection per currency, '*' for every other. A malformed entry is
+     * skipped; an unset or empty value keeps the documented default.
+     *
+     * @return array<string,string>
+     */
+    private static function collectionFees(): array
+    {
+        $fees = [];
+        foreach (explode(',', self::env('MARZPAY_COLLECTION_FEE_PERCENT')) as $pair) {
+            [$currency, $percent] = array_map('trim', explode(':', $pair, 2)) + [1 => ''];
+            $currency = strtoupper($currency);
+            if (($currency === '*' || preg_match('/^[A-Z]{3}$/', $currency) === 1) && is_numeric($percent) && (float) $percent >= 0 && (float) $percent < 50) {
+                $fees[$currency] = $percent;
+            }
+        }
+
+        return $fees === [] ? MarzPayGateway::COLLECTION_FEE_PERCENT : $fees;
+    }
+
     private static function checkoutHosts(): array
     {
         $hosts = [strtolower((string) parse_url(self::marzPayBase(), PHP_URL_HOST))];

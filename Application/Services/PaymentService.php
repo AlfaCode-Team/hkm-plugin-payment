@@ -630,7 +630,26 @@ final class PaymentService implements PaymentServiceContract
         // Collections only: this is what stops "asked for 50,000, paid 500" from
         // fulfilling the order. A payout's reported amount may or may not include
         // the provider's charge, and it is money WE sent.
+        // A provider may report the GROSS it collected — what was asked plus its
+        // own charge (MarzPay: 3-4%). The gateway names that charge; the amount
+        // asked must then be exactly what is left once it is taken off.
+        $netOfFee = $result->amount !== null && $result->providerFee !== null
+            && $result->providerFee->currency === $result->amount->currency
+            && $result->amount->minor - $result->providerFee->minor === $payment->amount()->minor
+            && $result->amount->currency === $payment->amount()->currency;
+
         if ($target === PaymentStatus::Succeeded
+            && $payment->direction() === PaymentDirection::Collection
+            && $result->amount !== null
+            && $netOfFee) {
+            $this->journalFor($payment, 'check.fee_included', $via, [
+                'detail' => sprintf(
+                    'Provider reports %s %s: %s asked + %s provider fee.',
+                    $result->amount->toMajor(), $result->amount->currency,
+                    $payment->amount()->toMajor(), $result->providerFee->toMajor(),
+                ),
+            ]);
+        } elseif ($target === PaymentStatus::Succeeded
             && $payment->direction() === PaymentDirection::Collection
             && $result->amount !== null
             && !$result->amount->equals($payment->amount())) {

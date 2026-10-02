@@ -63,9 +63,15 @@ final class MarzPayGateway implements PaymentGateway, PhoneVerificationGateway, 
     /** verification_status words that mean the lookup did not verify the number. */
     private const NOT_VERIFIED_WORDS = ['failed', 'not_found', 'not_verified', 'unverified', 'invalid', 'not_registered', 'unregistered'];
 
+    /** MarzPay's charge on a collection, percent per currency ('*' = any other). */
+    public const COLLECTION_FEE_PERCENT = ['UGX' => '3', '*' => '4'];
+
     /**
      * @param list<string> $checkoutHosts hosts a card redirect_url may point at
      *                                    (default: MarzPay's own wallet host)
+     * @param array<string,string> $collectionFeePercent MarzPay's charge on a
+     *        collection, percent per currency ('*' = every other currency) —
+     *        the amount a lookup reports may include it (see includedFee())
      */
     public function __construct(
         private readonly MarzPayClient $client,
@@ -73,6 +79,7 @@ final class MarzPayGateway implements PaymentGateway, PhoneVerificationGateway, 
         private readonly string $webhookSecret = '',
         private readonly int $signatureTolerance = 300,
         private readonly array $checkoutHosts = ['wallet.wearemarz.com'],
+        private readonly array $collectionFeePercent = self::COLLECTION_FEE_PERCENT,
     ) {
     }
 
@@ -153,6 +160,7 @@ final class MarzPayGateway implements PaymentGateway, PhoneVerificationGateway, 
             self::str($transaction['status'] ?? null),
             self::str($payload['event_type'] ?? null),
         );
+        $amount = self::money($transaction['amount'] ?? null);
 
         return new GatewayResult(
             status:                $status,
@@ -160,7 +168,8 @@ final class MarzPayGateway implements PaymentGateway, PhoneVerificationGateway, 
             providerUuid:          self::str($transaction['uuid'] ?? null),
             providerReference:     $isPayout ? self::str($transaction['reference'] ?? null) : null,
             providerTransactionId: self::str($detail['provider_transaction_id'] ?? null),
-            amount:                self::money($transaction['amount'] ?? null),
+            amount:                $amount,
+            providerFee:           $isPayout ? null : $this->includedFee($payment->amount(), $amount),
             // The provider's own word when it is the one that decided, else
             // the outcome the event named ("marzpay.failed", not ".processing").
             failureCode:           $status->isFinal() && $status !== PaymentStatus::Succeeded
@@ -465,6 +474,43 @@ final class MarzPayGateway implements PaymentGateway, PhoneVerificationGateway, 
             // not final. An unknown word must never read as money received.
             default                                                              => PaymentStatus::Pending,
         };
+    }
+
+    /**
+     * MarzPay's fee, when the amount it reports for a collection is what we
+     * asked PLUS its charge: 5,047.00 CDF asked comes back as 5,248.88 (4%),
+     * 5,000 UGX as 5,150 (3%). Sometimes it reports the bare amount; then
+     * there is no fee to account for and this is null.
+     *
+     * Only an amount that matches the schedule is explained this way — the
+     * exact fee, its rounding either way by one minor unit, or rounded to a
+     * whole unit of the currency. Anything else stays unexplained, and the
+     * service refuses to settle a payment whose amount it cannot account for.
+     */
+    private function includedFee(Money $asked, ?Money $reported): ?Money
+    {
+        if ($reported === null || $reported->currency !== $asked->currency || $reported->minor <= $asked->minor) {
+            return null;
+        }
+
+        $percent = $this->collectionFeePercent[$asked->currency] ?? $this->collectionFeePercent['*'] ?? null;
+        if ($percent === null || !is_numeric($percent) || (float) $percent <= 0) {
+            return null;
+        }
+
+        // Basis points, so the arithmetic stays in integers.
+        $bps   = (int) round((float) $percent * 100);
+        $exact = $asked->minor * $bps;                 // fee × 10,000, in minor units
+        $floor = intdiv($exact, 10_000);
+        $ceil  = $floor + ($exact % 10_000 === 0 ? 0 : 1);
+        $unit  = 10 ** Money::exponentOf($asked->currency);
+
+        $fee = $reported->minor - $asked->minor;
+        $explained = $fee >= $floor - 1 && $fee <= $ceil + 1
+            || $fee === intdiv($floor, $unit) * $unit                       // rounded down to a whole unit
+            || $fee === intdiv($ceil + $unit - 1, $unit) * $unit;           // rounded up to a whole unit
+
+        return $explained ? Money::ofMinor($fee, $asked->currency) : null;
     }
 
     /**

@@ -26,6 +26,10 @@ final readonly class GatewayResult
         public ?Money $amount = null,
         public ?string $failureCode = null,
         public ?string $failureMessage = null,
+        // The provider's own charge INCLUDED in `amount`, when the provider
+        // reports the gross (MarzPay adds 3-4% to a collection). The service
+        // then checks amount - providerFee against what was asked.
+        public ?Money $providerFee = null,
     ) {
     }
 }

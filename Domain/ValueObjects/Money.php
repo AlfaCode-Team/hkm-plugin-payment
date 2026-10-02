@@ -125,6 +125,12 @@ final readonly class Money
         return isset(self::EXPONENTS[strtoupper($currency)]);
     }
 
+    /** Minor-unit exponent of a supported currency (UGX 0, CDF 2). */
+    public static function exponentOf(string $currency): int
+    {
+        return self::EXPONENTS[strtoupper($currency)] ?? throw new \DomainException("Unsupported currency [{$currency}].");
+    }
+
     /** The major-unit amount as a plain decimal string ("5000", "12.50"). */
     public function toMajor(): string
     {
