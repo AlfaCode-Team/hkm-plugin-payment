@@ -35,7 +35,7 @@ hkm migrate:run                    # central database
 hkm tenants:migrate                # tenant databases, on a Tenancy project
 ```
 
-Requires the `database.management` and `http.client` plugins, and kernel `^1.13.1`.
+Requires the `database.management` and `http.client` plugins, and kernel `^1.19.0`.
 
 ### Environment
 
